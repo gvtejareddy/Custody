@@ -1,0 +1,52 @@
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: custody
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  servicebus-emulator:
+    image: paolosalvatori/servicebus-emulator:latest
+    container_name: servicebus-emulator
+    ports:
+      - "5671:5671"
+      - "8080:8080"
+    environment:
+      - SERVICEBUS_DEV_ACCESS_KEY=RootManageSharedAccessKey
+
+  sb-init:
+    image: node:18
+    working_dir: /work
+    volumes:
+      - ./scripts/sb-init:/work
+    environment:
+      - AZURE_SERVICE_BUS_CONNECTION_STRING=${AZURE_SERVICE_BUS_CONNECTION_STRING}
+      - OUTBOX_QUEUE_NAME=${OUTBOX_QUEUE_NAME}
+    depends_on:
+      - servicebus-emulator
+    command: ["/bin/sh", "-c", "npm install --no-audit --no-fund && node create-queue.js"]
+    restart: "no"
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/custody
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: password
+      # Use the emulator service hostname in connection string
+      AZURE_SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=RootManageSharedAccessKey"
+      OUTBOX_QUEUE_NAME: outbox-events
+    depends_on:
+      - db
+      - servicebus-emulator
+
+volumes:
+  db-data:

@@ -1,0 +1,55 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/custody}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:password}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          lob:
+            non_contextual_creation: true
+
+flyway:
+  enabled: true
+  locations: classpath:db/migration
+
+logging:
+  level:
+    root: INFO
+    com.bank.custody: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+
+fireblocks:
+  basePath: ${FIREBLOCKS_BASE_PATH:https://sandbox-api.fireblocks.io/v1}
+  apiKey: ${FIREBLOCKS_API_KEY:YOUR_SANDBOX_API_KEY_HERE}
+  secretKey: ${FIREBLOCKS_SECRET_KEY:YOUR_SANDBOX_SECRET_KEY_OR_PATH_HERE}
+  privateKeyPath: ${FIREBLOCKS_PRIVATE_KEY_PATH:}
+  webhook:
+    signingSecret: ${FIREBLOCKS_WEBHOOK_SIGNING_SECRET:}
+    publicKeyPath: ${FIREBLOCKS_WEBHOOK_PUBLIC_KEY_PATH:}
+    verificationMethod: ${FIREBLOCKS_WEBHOOK_VERIFICATION_METHOD:HMAC_SHA256}
+
+azure:
+  servicebus:
+    connection-string: ${AZURE_SERVICE_BUS_CONNECTION_STRING:}
+
+outbox:
+  queue-name: ${OUTBOX_QUEUE_NAME:outbox-events}
+
+assets:
+  allow-list:
+    - BTC
+    - ETH
+    - USDC
