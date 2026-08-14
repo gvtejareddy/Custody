@@ -7,7 +7,7 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.web.SecurityFilterChain;
 
-/** Test-only chain; authentication is covered independently from workflow tests. */
+/** Test-only chain; authentication is covered independently of workflow tests. */
 @TestConfiguration
 @Profile("test")
 public class TestSecurityConfiguration {
