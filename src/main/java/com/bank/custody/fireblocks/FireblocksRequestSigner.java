@@ -1,7 +1,8 @@
 package com.bank.custody.fireblocks;
 
-import org.springframework.stereotype.Component;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Component;
+
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.util.Base64;

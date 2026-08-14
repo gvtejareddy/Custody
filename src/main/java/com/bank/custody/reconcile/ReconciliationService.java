@@ -1,11 +1,10 @@
 package com.bank.custody.reconcile;
 
+import com.bank.custody.position.Position;
+import com.bank.custody.position.PositionRepository;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-
-import com.bank.custody.position.PositionRepository;
-import com.bank.custody.position.Position;
 
 import java.util.List;
 import java.util.Map;

@@ -1,8 +1,8 @@
 package com.bank.custody.fireblocks;
 
-import com.fireblocks.sdk.Fireblocks;
-import com.fireblocks.sdk.ConfigurationOptions;
 import com.fireblocks.sdk.BasePath;
+import com.fireblocks.sdk.ConfigurationOptions;
+import com.fireblocks.sdk.Fireblocks;
 
 /**
  * Simple Fireblocks SDK wrapper. Initializes the SDK and exposes the

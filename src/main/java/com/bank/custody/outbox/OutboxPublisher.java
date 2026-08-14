@@ -1,9 +1,8 @@
 package com.bank.custody.outbox;
 
-import org.springframework.stereotype.Component;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
- 
 
 import java.time.OffsetDateTime;
 import java.util.List;

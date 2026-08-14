@@ -1,9 +1,9 @@
 package com.bank.custody.transaction;
 
+import com.bank.custody.compliance.ComplianceProvider;
 import com.bank.custody.execution.CustodyExecutionProvider;
 import com.bank.custody.execution.provider.ProviderTransaction;
 import com.bank.custody.ledger.LedgerService;
-import com.bank.custody.compliance.ComplianceProvider;
 import com.bank.custody.policy.PolicyEngine;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;

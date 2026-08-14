@@ -3,9 +3,9 @@ package com.bank.custody.api;
 import com.bank.custody.account.Account;
 import com.bank.custody.account.AccountRepository;
 import com.bank.custody.audit.AuditService;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.http.ResponseEntity;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping("/api/v1/accounts")
