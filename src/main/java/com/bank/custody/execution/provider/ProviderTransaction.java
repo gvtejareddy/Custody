@@ -6,7 +6,7 @@ public class ProviderTransaction {
 
     public String getProviderTransactionId() { return providerTransactionId; }
     public void setProviderTransactionId(String providerTransactionId) { this.providerTransactionId = providerTransactionId; }
-
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
+
 }

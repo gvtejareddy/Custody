@@ -1,0 +1,20 @@
+package com.bank.custody;
+
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Profile;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.web.SecurityFilterChain;
+
+/** Test-only chain; authentication is covered independently from workflow tests. */
+@TestConfiguration
+@Profile("test")
+public class TestSecurityConfiguration {
+    @Bean
+    SecurityFilterChain testSecurity(HttpSecurity http) throws Exception {
+        return http.csrf(AbstractHttpConfigurer::disable)
+                .authorizeHttpRequests(requests -> requests.anyRequest().permitAll())
+                .build();
+    }
+}

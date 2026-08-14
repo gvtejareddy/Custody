@@ -1,52 +1,58 @@
-version: '3.8'
 services:
-  db:
-    image: postgres:15
+  postgres:
+    image: postgres:16
+    container_name: custody-postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
       POSTGRES_DB: custody
+      POSTGRES_USER: custody_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdevpassword}
     ports:
       - "5432:5432"
     volumes:
-      - db-data:/var/lib/postgresql/data
+      - custody_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U custody_app -d custody"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-  servicebus-emulator:
-    image: paolosalvatori/servicebus-emulator:latest
-    container_name: servicebus-emulator
+  wiremock:
+    image: wiremock/wiremock:3.13.1
+    container_name: custody-wiremock
     ports:
-      - "5671:5671"
-      - "8080:8080"
-    environment:
-      - SERVICEBUS_DEV_ACCESS_KEY=RootManageSharedAccessKey
-
-  sb-init:
-    image: node:18
-    working_dir: /work
+      - "9561:8080"
     volumes:
-      - ./scripts/sb-init:/work
-    environment:
-      - AZURE_SERVICE_BUS_CONNECTION_STRING=${AZURE_SERVICE_BUS_CONNECTION_STRING}
-      - OUTBOX_QUEUE_NAME=${OUTBOX_QUEUE_NAME}
-    depends_on:
-      - servicebus-emulator
-    command: ["/bin/sh", "-c", "npm install --no-audit --no-fund && node create-queue.js"]
-    restart: "no"
+      - ./wiremock/mappings:/home/wiremock/mappings
+      - ./wiremock/__files:/home/wiremock/__files
 
   app:
     build: .
+    container_name: custody-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/custody
+      SPRING_DATASOURCE_USERNAME: custody_app
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-localdevpassword}
+      FIREBLOCKS_BASE_PATH: ${FIREBLOCKS_BASE_PATH:-http://wiremock:8080}
+      FIREBLOCKS_API_KEY: ${FIREBLOCKS_API_KEY:-}
+      MESSAGING_MODE: ${MESSAGING_MODE:-local}
     ports:
       - "8080:8080"
+
+  pgadmin:
+    image: dpage/pgadmin4:9.10
+    container_name: custody-pgadmin
+    profiles: ["tools"]
     environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/custody
-      SPRING_DATASOURCE_USERNAME: postgres
-      SPRING_DATASOURCE_PASSWORD: password
-      # Use the emulator service hostname in connection string
-      AZURE_SERVICE_BUS_CONNECTION_STRING: "Endpoint=sb://servicebus-emulator/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=RootManageSharedAccessKey"
-      OUTBOX_QUEUE_NAME: outbox-events
+      PGADMIN_DEFAULT_EMAIL: admin@example.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
     depends_on:
-      - db
-      - servicebus-emulator
+      - postgres
 
 volumes:
-  db-data:
+  custody_pg_data:

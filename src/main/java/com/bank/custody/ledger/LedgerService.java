@@ -1,6 +1,7 @@
 package com.bank.custody.ledger;
 
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -23,6 +24,7 @@ public class LedgerService {
         this(ledgerRepo, positionRepository, null);
     }
 
+    @Autowired
     public LedgerService(LedgerRepository ledgerRepo, PositionRepository positionRepository, com.bank.custody.audit.AuditService auditService) {
         this.ledgerRepo = ledgerRepo;
         this.positionRepository = positionRepository;

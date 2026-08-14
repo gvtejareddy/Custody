@@ -4,8 +4,8 @@ server:
 spring:
   datasource:
     url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/custody}
-    username: ${SPRING_DATASOURCE_USERNAME:postgres}
-    password: ${SPRING_DATASOURCE_PASSWORD:password}
+    username: ${SPRING_DATASOURCE_USERNAME:custody_app}
+    password: ${SPRING_DATASOURCE_PASSWORD:localdevpassword}
   jpa:
     hibernate:
       ddl-auto: validate
@@ -16,9 +16,8 @@ spring:
           lob:
             non_contextual_creation: true
 
-flyway:
-  enabled: true
-  locations: classpath:db/migration
+  liquibase:
+    change-log: classpath:db/changelog/db.changelog-master.yaml
 
 logging:
   level:
@@ -32,21 +31,26 @@ management:
         include: health,info,prometheus
 
 fireblocks:
-  basePath: ${FIREBLOCKS_BASE_PATH:https://sandbox-api.fireblocks.io/v1}
-  apiKey: ${FIREBLOCKS_API_KEY:YOUR_SANDBOX_API_KEY_HERE}
-  secretKey: ${FIREBLOCKS_SECRET_KEY:YOUR_SANDBOX_SECRET_KEY_OR_PATH_HERE}
+  basePath: ${FIREBLOCKS_BASE_PATH:http://localhost:9561}
+  apiKey: ${FIREBLOCKS_API_KEY:}
+  secretKey: ${FIREBLOCKS_SECRET_KEY:}
   privateKeyPath: ${FIREBLOCKS_PRIVATE_KEY_PATH:}
   webhook:
     signingSecret: ${FIREBLOCKS_WEBHOOK_SIGNING_SECRET:}
     publicKeyPath: ${FIREBLOCKS_WEBHOOK_PUBLIC_KEY_PATH:}
     verificationMethod: ${FIREBLOCKS_WEBHOOK_VERIFICATION_METHOD:HMAC_SHA256}
 
-azure:
-  servicebus:
-    connection-string: ${AZURE_SERVICE_BUS_CONNECTION_STRING:}
-
 outbox:
   queue-name: ${OUTBOX_QUEUE_NAME:outbox-events}
+
+messaging:
+  mode: ${MESSAGING_MODE:local}
+  servicebus:
+    connection-string: ${SERVICEBUS_CONNECTION_STRING:}
+
+security:
+  local-jwt:
+    token: ${LOCAL_JWT_TOKEN:local-dev-token}
 
 assets:
   allow-list:

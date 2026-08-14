@@ -19,7 +19,7 @@ public class LocalSecretLoader {
         if ((props.getSecretKey() == null || props.getSecretKey().isBlank()) && props.getPrivateKeyPath() != null && !props.getPrivateKeyPath().isBlank()) {
             try {
                 String content = Files.readString(Path.of(props.getPrivateKeyPath()));
-                if (content != null && !content.isBlank()) {
+                if (!content.isBlank()) {
                     props.setSecretKey(content.trim());
                 }
             } catch (Exception ignored) {

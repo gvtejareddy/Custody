@@ -1,16 +1,21 @@
 # Digital Asset Custody MVP — AI Agent Build Guide
 
+> **Revision notes (this version):** re-scoped for **local-first development**. Azure is deferred to Appendix B — you build and fully test the MVP on your own machine with Docker, then migrate to Azure later without changing the application's abstractions. Concretely: swapped **Flyway → Liquibase**, pinned **PostgreSQL 16**, replaced the Azure-only local setup with a **Docker Compose** stack (Postgres + app + an *optional* local Service Bus emulator), and removed/annotated every Azure-specific instruction so it doesn't block local build/test. All prior architectural rules (bank owns the domain, Fireblocks is execution-only, key-custody model, ledger immutability, idempotency, etc.) are unchanged — only the infrastructure/tooling layer changed.
+
 ## 0. Purpose
 
-Build a **bank-owned digital asset custody MVP** for an EU/Netherlands bank using:
+Build a **bank-owned digital asset custody MVP**, buildable and fully testable **on a local machine with Docker**, using:
 
 - Java 25
-- Spring Boot 4.x
-- PostgreSQL
-- liquid base
-- Fireblocks
+- Spring Boot 4.1.x (Spring Framework 7)
+- PostgreSQL 16
+- Liquibase (schema migrations)
+- Docker / Docker Compose (local infra)
+- Fireblocks (sandbox, for wallet/key/signing/blockchain execution)
 
-The MVP must provide a bank-owned custody control plane while using Fireblocks for wallet/key/signing/blockchain execution.
+Azure is the intended production target but is **not required to build or test the MVP**. Everything in §1–§72 runs locally. Azure-specific deployment concerns are isolated to Appendix B so they don't block the agent.
+
+> **Version note:** Spring Boot 3.5.x reached end of OSS support on 30 June 2026. Spring Boot 4.0 (Nov 2025) and 4.1 (Jun 2026) are the only lines in active support, both require Java 17 minimum with first-class Java 25 support. This guide standardizes on **Java 25 + Spring Boot 4.1.x** everywhere.
 
 ### Core principle
 
@@ -20,9 +25,25 @@ Do not make Fireblocks the customer position ledger or expose Fireblocks' domain
 
 ---
 
-# 1. MVP Scope
+## 0.1 Key-Custody Model — Decide Before Sprint 3
 
-## 1.1 In scope
+This MVP's non-negotiable architectural constraint is that **the bank must retain control of key shares regardless of vendor**. This must be resolved by the architecture review board before any Fireblocks adapter code (§27–29) is written, because it determines the workspace/vault topology, the signing-approval flow, and what "the bank owns the transaction lifecycle" means in practice. This decision is infrastructure-agnostic (local vs. Azure doesn't change it), so it can and should be settled in parallel with Sprint 1–2 local build work.
+
+| Model | Description | Bank key-share control |
+|---|---|---|
+| **Fireblocks-hosted MPC (standard)** | Fireblocks operates the MPC/TSS cluster; the bank co-signs via policy/quorum but Fireblocks holds infrastructure for signing shards. | Partial — bank approves via policy engine, but does not independently hold all key shares. |
+| **Fireblocks Off-Exchange / Dedicated / self-hosted co-signer** | Bank operates its own co-signer (on-prem or in its own cloud tenant) holding one or more MPC key shares; Fireblocks cannot complete a signature without the bank's shard. | Bank retains a key share — closer to satisfying "bank retains all key shares." |
+
+Neither configuration is a pure bank-owned HSM mul
+ti-sig model. If the non-negotiable is interpreted strictly (bank holds *all* shares, not just one of several), Fireblocks MPC alone cannot satisfy it — the bank would need either a self-hosted co-signer/dedicated workspace where Fireblocks never has quorum without the bank, or HSM-based multi-sig where the bank's own HSM holds a required signer and Fireblocks only provides broadcast/orchestration.
+
+**Action item:** record the chosen model, the resulting vault/workspace topology, and the signing-quorum policy in an ADR before Sprint 3. For local development, the Fireblocks **sandbox** environment can be used regardless of which model is chosen — sandbox testing doesn't require the production key-custody topology to be finalized, only the adapter interface (§27) to be stable.
+
+---
+
+## 1. MVP Scope
+
+### 1.1 In scope
 
 The MVP supports:
 
@@ -43,11 +64,11 @@ The MVP supports:
 15. Reconciliation against Fireblocks balances
 16. Immutable/auditable transaction history
 17. Product-facing REST APIs
-18. Authentication/authorization through existing bank IAM
+18. Authentication/authorization (local: stubbed/simple JWT; bank IAM integration is a later step)
 19. Idempotency
 20. Operational monitoring and exception handling
 
-## 1.2 Initial assets
+### 1.2 Initial assets
 
 Use only assets explicitly approved by the bank.
 
@@ -57,9 +78,9 @@ For the initial technical MVP, configure a small allow-list such as:
 - ETH / Ethereum
 - USDC / approved network
 
-Do not assume that an asset is approved merely because Fireblocks supports it.
+Do not assume that an asset is approved merely because Fireblocks supports it. **CASP/MiCA note:** the asset allow-list should trace back to whatever crypto-asset classification and due-diligence record Compliance requires under MiCA before an asset is offered in custody — keep a pointer (`compliance_reference`) from `asset` to that record rather than treating the allow-list as purely technical config.
 
-## 1.3 Out of scope for MVP
+### 1.3 Out of scope for MVP
 
 Do NOT build:
 
@@ -83,12 +104,13 @@ Do NOT build:
 - Advanced fee engine
 - Complex tax engine
 - Automated recovery/failover between custody vendors
+- Any Azure-specific deployment automation (defer to Appendix B)
 
 These can be future phases.
 
 ---
 
-# 2. Target Architecture
+## 2. Target Architecture
 
 ```text
                          BANK PRODUCTS
@@ -101,7 +123,7 @@ These can be future phases.
                             v
                   +-----------------------+
                   | Digital Asset API     |
-                  | Spring Boot          |
+                  | Spring Boot           |
                   +-----------+-----------+
                               |
                               v
@@ -120,7 +142,7 @@ These can be future phases.
                               v
                   +-----------------------+
                   | Position / Ledger     |
-                  | PostgreSQL            |
+                  | PostgreSQL 16         |
                   +-----------+-----------+
                               |
                               v
@@ -133,47 +155,47 @@ These can be future phases.
                   | Fireblocks            |
                   | Vaults / Wallets      |
                   | MPC / Signing         |
-                  | Blockchain execution   |
+                  | Blockchain execution  |
                   +-----------+-----------+
                               |
                               v
                          BLOCKCHAINS
 ```
 
-## 2.1 External systems
+### 2.1 External systems (local development)
 
 ```text
-Bank IAM
+Local stub / mock IAM (JWT, hardcoded roles)
    |
    v
 Digital Asset API
 
-AML / Sanctions / Risk
+AML / Sanctions / Risk  -->  WireMock stub (sandbox provider later)
    |
    v
 Compliance Adapter
 
-Fireblocks
+Fireblocks (sandbox tenant)
    |
    +--> Wallets
    +--> MPC/signing
-   +--> Blockchain connectivity
-   +--> Transaction events
+   +--> Blockchain connectivity (testnets)
+   +--> Transaction events (webhook -> local ngrok/tunnel or replayed via test harness)
 
-Azure
+Docker (local)
    |
-   +--> PostgreSQL
-   +--> Key Vault
-   +--> Service Bus
-   +--> API Management
-   +--> Monitoring
+   +--> PostgreSQL 16 (container)
+   +--> Local outbox table / optional Service Bus emulator (container)
+   +--> pgAdmin (optional, container)
 ```
+
+Azure equivalents (Key Vault, Service Bus, API Management, Monitor) are mapped in **Appendix B** and are not needed to build or test locally.
 
 ---
 
-# 3. Architectural Boundaries
+## 3. Architectural Boundaries
 
-## 3.1 Bank-owned
+### 3.1 Bank-owned
 
 The bank application must own:
 
@@ -193,13 +215,13 @@ The bank application must own:
 - Audit trail
 - API contract
 
-## 3.2 Fireblocks-owned
+### 3.2 Fireblocks-owned
 
 For MVP, Fireblocks provides:
 
 - Wallet infrastructure
 - Vault/wallet infrastructure
-- Cryptographic signing/MPC
+- Cryptographic signing/MPC (subject to the key-custody model chosen in §0.1)
 - Blockchain transaction execution
 - Blockchain connectivity
 - Provider transaction status
@@ -207,34 +229,29 @@ For MVP, Fireblocks provides:
 
 The bank application must maintain its own mapping to Fireblocks.
 
-## 3.3 Never expose Fireblocks directly
+### 3.3 Never expose Fireblocks directly
 
 Bank products must NOT call Fireblocks directly.
 
 Correct:
 
 ```text
-Product
-  -> Bank Digital Asset API
-  -> Custody Orchestrator
-  -> Fireblocks Adapter
-  -> Fireblocks
+Product -> Bank Digital Asset API -> Custody Orchestrator -> Fireblocks Adapter -> Fireblocks
 ```
 
 Incorrect:
 
 ```text
-Product
-  -> Fireblocks API
+Product -> Fireblocks API
 ```
 
 ---
 
-# 4. Recommended MVP Deployment Shape
+## 4. Recommended MVP Deployment Shape
 
 Do NOT start with many microservices.
 
-Use one Spring Boot application with strict modules/packages.
+Use one Spring Boot application with strict modules/packages, runnable entirely via `docker-compose up`.
 
 ```text
 digital-asset-custody/
@@ -246,62 +263,71 @@ digital-asset-custody/
   policy/
   compliance/
   fireblocks/
+  messaging/          <- new: abstracts local outbox vs. emulator vs. future Azure Service Bus
   reconciliation/
   audit/
   api/
 ```
 
-Split into independent services later only if required.
-
-This reduces MVP complexity and distributed-transaction problems.
+Split into independent services later only if required. This reduces MVP complexity and distributed-transaction problems.
 
 ---
 
-# 5. Technology Requirements
+## 5. Technology Requirements
 
-## Application
+### 5.1 Application
 
-- Java 21
-- Spring Boot 3.x
-- Spring Web
+- Java 25
+- Spring Boot 4.1.x (Spring Framework 7)
+- Spring Web (Spring Boot 4's API Versioning support can back `/v1/`)
 - Spring Validation
 - Spring Data JPA
 - Spring Security
-- PostgreSQL driver
-- Flyway
+- PostgreSQL JDBC driver
+- **Liquibase** (`liquibase-core`, `liquibase-maven-plugin` or Spring Boot's `spring-boot-starter-liquibase` auto-wiring)
 - Actuator
 - Jackson
 
-## Testing
+> If Java 25 is not yet approved in your environment, Java 21 + Spring Boot 4.1.x (still supports Java 17+) is an acceptable fallback baseline. Do **not** fall back to Spring Boot 3.x — that line is EOL.
+
+### 5.2 Local infrastructure (Docker)
+
+- **PostgreSQL 16** (`postgres:16` official image)
+- **Docker Compose** to orchestrate Postgres + app (+ optional emulator, see §5.4)
+- **pgAdmin** or any Postgres GUI (optional, for manual inspection)
+- **WireMock** (standalone or embedded) to simulate Fireblocks and the AML provider for local runs without hitting sandbox APIs
+- **Testcontainers** for automated integration tests (spins up its own Postgres, independent of the dev Compose stack)
+
+### 5.3 Testing
 
 - JUnit 5
 - Mockito
-- Testcontainers
+- Testcontainers (PostgreSQL 16 module)
 - WireMock or equivalent for Fireblocks API simulation
 
-## Azure
+### 5.4 Messaging — local options ("emulator if needed")
 
-Use existing bank standards where available.
+The outbox pattern (§21, §48) needs *something* to publish to. For local dev you have two options; pick based on how much you want to test messaging behavior itself vs. just the domain logic:
 
-Preferred MVP infrastructure:
+| Option | What it is | When to use |
+|---|---|---|
+| **A — Local outbox poller (default, no extra container)** | A scheduled `@Component` polls `outbox_event` rows with `status = PENDING` and marks them `PUBLISHED`, invoking an in-process `EventPublisher` interface (logs the event, or calls a no-op). No broker needed. | Default for MVP local dev. Fastest to start, zero extra moving parts, fully exercises the outbox-write transaction guarantee (§21/§48) which is the part that actually matters for correctness. |
+| **B — Azure Service Bus Emulator (Docker, optional)** | Microsoft's official local emulator (`mcr.microsoft.com/azure-messaging/servicebus-emulator`, requires a paired `azure-sql-edge` container). Speaks the real Service Bus AMQP protocol, so the app can use the actual `azure-messaging-servicebus` SDK locally. | Turn this on (`docker compose --profile messaging up`) when you want to test topic/subscription fan-out, retries, or dead-lettering behavior before moving to Azure — see Appendix B. It is **not required** to complete the MVP scope in §1.1. |
 
-- Azure Container Apps or AKS
-- Azure Database for PostgreSQL
-- Azure Service Bus
-- Azure Key Vault
-- Azure API Management
-- Azure Monitor
-- Application Insights
-- Log Analytics
-- Managed Identity
+Implement `EventPublisher` as an interface from day one so Option A and Option B are interchangeable without touching domain code — this is the same isolation principle as §59 for Fireblocks.
 
-Do not create duplicate bank infrastructure if existing services are already approved.
+```java
+public interface EventPublisher {
+    void publish(OutboxEvent event);
+}
+```
+
+- `LocalLoggingEventPublisher` — Option A, always available, default Spring profile.
+- `ServiceBusEventPublisher` — Option B, active only under a `messaging` Spring profile, wraps the Azure Service Bus SDK pointed at the local emulator's connection string (and, later, at real Azure Service Bus — same code, different connection string).
 
 ---
 
-# 6. Repository Structure
-
-Create:
+## 6. Repository Structure
 
 ```text
 digital-asset-custody/
@@ -309,6 +335,11 @@ digital-asset-custody/
 ├── pom.xml
 ├── Dockerfile
 ├── docker-compose.yml
+├── docker-compose.messaging.yml     <- optional Service Bus emulator overlay (§5.4 Option B)
+├── config/
+│   └── servicebus-emulator/
+│       └── Config.json              <- only needed if using Option B
+├── .env.example
 ├── .gitignore
 │
 ├── src/
@@ -317,20 +348,21 @@ digital-asset-custody/
 │   │   │
 │   │   └── resources/
 │   │       ├── application.yml
-│   │       └── db/migration/
+│   │       ├── application-local.yml
+│   │       └── db/changelog/
+│   │           ├── db.changelog-master.yaml
+│   │           └── changes/
 │   │
 │   └── test/
 │
-└── infrastructure/
-    ├── terraform/
-    └── deployment/
+└── infrastructure/                  <- placeholder for later Azure IaC (Appendix B), empty for MVP
 ```
 
 ---
 
-# 7. Step 1 — Create Spring Boot Application
+## 7. Step 1 — Create Spring Boot Application
 
-Create a Spring Boot application using Java 21.
+Create a Spring Boot application using Java 25 and Spring Boot 4.1.x.
 
 Required dependencies:
 
@@ -341,73 +373,155 @@ spring-boot-starter-security
 spring-boot-starter-data-jpa
 spring-boot-starter-actuator
 postgresql
-flyway-core
+liquibase-core
 lombok (optional)
 ```
 
-Use Maven unless the bank standard is Gradle.
+Use Maven unless you prefer Gradle.
 
 ---
 
-# 8. Step 2 — Configuration
+## 8. Step 2 — Configuration
 
-Use environment variables/secrets.
+Use environment variables/`.env` for local secrets. Never commit real credentials.
 
 Never commit:
 
-- Fireblocks private keys
-- Fireblocks API credentials
-- Azure credentials
+- Fireblocks private/sandbox keys
 - database passwords
 - JWT signing secrets
 
-Use:
+For MVP local dev, environment variables (via `.env`, loaded by Docker Compose) are the source of truth. Key Vault/Managed Identity are Azure-phase concerns — see Appendix B.
 
-```text
-Azure Managed Identity
-       |
-       v
-Azure Key Vault
-       |
-       v
-Spring Boot
-```
+### 8.1 Local environment / configuration
 
-Local development may use environment variables.
+| Variable | Purpose | Local default |
+|---|---|---|
+| `SPRING_PROFILES_ACTIVE` | Active profile | `local` |
+| `SPRING_DATASOURCE_URL` | Postgres JDBC URL | `jdbc:postgresql://localhost:5432/custody` |
+| `SPRING_DATASOURCE_USERNAME` | DB user | `custody_app` |
+| `SPRING_DATASOURCE_PASSWORD` | DB password | set in `.env`, never committed |
+| `FIREBLOCKS_BASE_PATH` | Fireblocks API base | `https://sandbox-api.fireblocks.io/v1` (or WireMock URL, e.g. `http://localhost:9561`) |
+| `FIREBLOCKS_API_KEY` | Fireblocks sandbox API key | `.env`, sandbox-only |
+| `FIREBLOCKS_SECRET_KEY` | Fireblocks sandbox signing key path | `.env` / mounted file, sandbox-only |
+| `FIREBLOCKS_WEBHOOK_PUBLIC_KEY` | Verify inbound webhook signatures | `.env`, sandbox-only |
+| `MESSAGING_MODE` | `local` (Option A) or `servicebus-emulator` (Option B) | `local` |
+| `SERVICEBUS_CONNECTION_STRING` | Only used when `MESSAGING_MODE=servicebus-emulator` | `Endpoint=sb://localhost:5672;...;UseDevelopmentEmulator=true;` |
 
----
-
-# 9. Step 3 — PostgreSQL and Flyway
-
-Create a PostgreSQL database.
-
-Use Flyway for ALL schema changes.
-
-Never manually modify production schema.
-
-Migration naming:
-
-```text
-V1__create_custody_account.sql
-V2__create_asset.sql
-V3__create_network.sql
-V4__create_position.sql
-V5__create_ledger.sql
-V6__create_transaction.sql
-V7__create_wallet_mapping.sql
-V8__create_compliance.sql
-V9__create_policy.sql
-V10__create_provider_event.sql
-V11__create_outbox.sql
-V12__create_reconciliation.sql
-V13__create_audit.sql
-```
+`.env.example` should list all of the above with placeholder values and comments — never a real secret.
 
 ---
 
-# 10. Step 4 — Database Model
+## 9. Step 3 — PostgreSQL 16 and Liquibase
 
-## 10.1 custody_account
+Run PostgreSQL 16 via Docker (see §75 for `docker-compose.yml`).
+
+Use **Liquibase** for ALL schema changes. Never manually modify the schema, even locally — treat local Postgres the same as you'll treat prod later, so migrations are proven before they matter.
+
+### 9.1 Changelog structure
+
+```text
+src/main/resources/db/changelog/
+├── db.changelog-master.yaml
+└── changes/
+    ├── 001-create-custody-account.yaml
+    ├── 002-create-asset.yaml
+    ├── 003-create-network.yaml
+    ├── 004-create-asset-network.yaml
+    ├── 005-create-position.yaml
+    ├── 006-create-ledger-entry.yaml
+    ├── 007-create-custody-transaction.yaml
+    ├── 008-create-wallet-mapping.yaml
+    ├── 009-create-compliance-screening.yaml
+    ├── 010-create-policy-decision.yaml
+    ├── 011-create-provider-event.yaml
+    ├── 012-create-outbox-event.yaml
+    ├── 013-create-reconciliation-result.yaml
+    └── 014-create-audit-event.yaml
+```
+
+`db.changelog-master.yaml`:
+
+```yaml
+databaseChangeLog:
+  - include:
+      file: db/changelog/changes/001-create-custody-account.yaml
+  - include:
+      file: db/changelog/changes/002-create-asset.yaml
+  - include:
+      file: db/changelog/changes/003-create-network.yaml
+  - include:
+      file: db/changelog/changes/004-create-asset-network.yaml
+  - include:
+      file: db/changelog/changes/005-create-position.yaml
+  - include:
+      file: db/changelog/changes/006-create-ledger-entry.yaml
+  - include:
+      file: db/changelog/changes/007-create-custody-transaction.yaml
+  - include:
+      file: db/changelog/changes/008-create-wallet-mapping.yaml
+  - include:
+      file: db/changelog/changes/009-create-compliance-screening.yaml
+  - include:
+      file: db/changelog/changes/010-create-policy-decision.yaml
+  - include:
+      file: db/changelog/changes/011-create-provider-event.yaml
+  - include:
+      file: db/changelog/changes/012-create-outbox-event.yaml
+  - include:
+      file: db/changelog/changes/013-create-reconciliation-result.yaml
+  - include:
+      file: db/changelog/changes/014-create-audit-event.yaml
+```
+
+Example changeset (`001-create-custody-account.yaml`):
+
+```yaml
+databaseChangeLog:
+  - changeSet:
+      id: 001-create-custody-account
+      author: custody-mvp
+      changes:
+        - createTable:
+            tableName: custody_account
+            columns:
+              - column:
+                  name: id
+                  type: uuid
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: customer_id
+                  type: varchar(100)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: status
+                  type: varchar(30)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: created_at
+                  type: timestamptz
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: timestamptz
+                  constraints:
+                    nullable: false
+```
+
+Spring Boot auto-runs Liquibase on startup against `SPRING_DATASOURCE_URL` when `liquibase-core` is on the classpath and `spring.liquibase.change-log` points at the master file (default location `classpath:/db/changelog/db.changelog-master.yaml` works if you don't override it).
+
+Rollback: every changeset should include a `rollback:` block for anything beyond a plain `createTable` (e.g. column adds/drops later) — this is what makes `mvn liquibase:rollback` usable locally when iterating on the schema.
+
+---
+
+## 10. Step 4 — Database Model
+
+### 10.1 custody_account
 
 ```sql
 CREATE TABLE custody_account (
@@ -418,6 +532,8 @@ CREATE TABLE custody_account (
     updated_at TIMESTAMPTZ NOT NULL
 );
 ```
+
+(Shown here as SQL for readability — implement as the Liquibase changeset per §9.1.)
 
 Statuses:
 
@@ -430,7 +546,7 @@ CLOSED
 
 ---
 
-# 11. asset
+## 11. asset
 
 ```sql
 CREATE TABLE asset (
@@ -439,6 +555,7 @@ CREATE TABLE asset (
     name VARCHAR(100),
     decimals INTEGER NOT NULL,
     status VARCHAR(30) NOT NULL,
+    compliance_reference VARCHAR(200),
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(symbol)
@@ -453,11 +570,11 @@ SUSPENDED
 DEPRECATED
 ```
 
-The application must reject unsupported assets.
+The application must reject unsupported assets. `compliance_reference` points to the bank's internal record of the MiCA/CASP due-diligence decision for that asset (see §1.2) — nullable for MVP, but keep the column so it isn't a later migration.
 
 ---
 
-# 12. network
+## 12. network
 
 ```sql
 CREATE TABLE network (
@@ -473,20 +590,11 @@ CREATE TABLE network (
 
 Do not use asset symbol as network identity.
 
-Example:
-
-```text
-USDC + Ethereum
-USDC + Solana
-```
-
-are different supported asset/network combinations.
+Example: `USDC + Ethereum` and `USDC + Solana` are different supported asset/network combinations.
 
 ---
 
-# 13. asset_network
-
-Create an explicit allow-list:
+## 13. asset_network
 
 ```sql
 CREATE TABLE asset_network (
@@ -507,9 +615,7 @@ Only ACTIVE asset/network combinations may be transacted.
 
 ---
 
-# 14. position
-
-This is the client position system of record.
+## 14. position
 
 ```sql
 CREATE TABLE position (
@@ -528,88 +634,63 @@ CREATE TABLE position (
 
     UNIQUE(custody_account_id, asset_id),
 
-    FOREIGN KEY(custody_account_id)
-        REFERENCES custody_account(id),
+    FOREIGN KEY(custody_account_id) REFERENCES custody_account(id),
+    FOREIGN KEY(asset_id) REFERENCES asset(id),
 
-    FOREIGN KEY(asset_id)
-        REFERENCES asset(id)
+    CONSTRAINT chk_position_non_negative
+        CHECK (available >= 0 AND locked >= 0 AND pending >= 0)
 );
 ```
 
-Use Java `BigDecimal`.
-
-Never use `double` or `float`.
+Use Java `BigDecimal`. Never use `double` or `float`. The `CHECK` constraint enforces the invariant from §67 at the database level, not just in application code.
 
 ---
 
-# 15. Ledger
-
-The ledger is immutable.
+## 15. Ledger
 
 ```sql
 CREATE TABLE ledger_entry (
     id UUID PRIMARY KEY,
-
     transaction_id UUID NOT NULL,
-
     custody_account_id UUID NOT NULL,
     asset_id UUID NOT NULL,
-
     entry_type VARCHAR(50) NOT NULL,
     direction VARCHAR(10) NOT NULL,
-
     amount NUMERIC(38,18) NOT NULL,
-
     created_at TIMESTAMPTZ NOT NULL,
-
     idempotency_key VARCHAR(200) NOT NULL UNIQUE,
 
-    FOREIGN KEY(custody_account_id)
-        REFERENCES custody_account(id),
-
-    FOREIGN KEY(asset_id)
-        REFERENCES asset(id)
+    FOREIGN KEY(custody_account_id) REFERENCES custody_account(id),
+    FOREIGN KEY(asset_id) REFERENCES asset(id)
 );
 ```
 
-Ledger entries must never be updated or deleted.
+Ledger entries must never be updated or deleted. Locally, revoke `UPDATE`/`DELETE` on this table from the app's Postgres role in a changeset (`REVOKE UPDATE, DELETE ON ledger_entry FROM custody_app;`) so immutability is enforced at the DB level from day one, not bolted on before production.
 
 Corrections are new compensating entries.
 
 ---
 
-# 16. Custody Transaction
+## 16. Custody Transaction
 
 ```sql
 CREATE TABLE custody_transaction (
     id UUID PRIMARY KEY,
-
     custody_account_id UUID NOT NULL,
     asset_id UUID NOT NULL,
     network_id UUID,
-
     type VARCHAR(40) NOT NULL,
     status VARCHAR(50) NOT NULL,
-
     amount NUMERIC(38,18) NOT NULL,
-
     destination_address VARCHAR(500),
-
     provider_transaction_id VARCHAR(200),
-
     idempotency_key VARCHAR(200) NOT NULL UNIQUE,
-
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
-    FOREIGN KEY(custody_account_id)
-        REFERENCES custody_account(id),
-
-    FOREIGN KEY(asset_id)
-        REFERENCES asset(id),
-
-    FOREIGN KEY(network_id)
-        REFERENCES network(id)
+    FOREIGN KEY(custody_account_id) REFERENCES custody_account(id),
+    FOREIGN KEY(asset_id) REFERENCES asset(id),
+    FOREIGN KEY(network_id) REFERENCES network(id)
 );
 ```
 
@@ -625,38 +706,27 @@ MVP only needs DEPOSIT and WITHDRAWAL.
 
 ---
 
-# 17. Wallet Mapping
+## 17. Wallet Mapping
 
 ```sql
 CREATE TABLE wallet_mapping (
     id UUID PRIMARY KEY,
-
     custody_account_id UUID NOT NULL,
     asset_id UUID NOT NULL,
     network_id UUID NOT NULL,
-
     provider VARCHAR(50) NOT NULL,
-
     provider_vault_id VARCHAR(200) NOT NULL,
     provider_wallet_id VARCHAR(200),
-
     blockchain_address VARCHAR(500),
-
     status VARCHAR(30) NOT NULL,
-
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     UNIQUE(custody_account_id, asset_id, network_id),
 
-    FOREIGN KEY(custody_account_id)
-        REFERENCES custody_account(id),
-
-    FOREIGN KEY(asset_id)
-        REFERENCES asset(id),
-
-    FOREIGN KEY(network_id)
-        REFERENCES network(id)
+    FOREIGN KEY(custody_account_id) REFERENCES custody_account(id),
+    FOREIGN KEY(asset_id) REFERENCES asset(id),
+    FOREIGN KEY(network_id) REFERENCES network(id)
 );
 ```
 
@@ -664,81 +734,57 @@ Provider-specific identifiers are isolated here.
 
 ---
 
-# 18. Compliance Screening
+## 18. Compliance Screening
 
 ```sql
 CREATE TABLE compliance_screening (
     id UUID PRIMARY KEY,
-
     transaction_id UUID NOT NULL,
-
     screening_type VARCHAR(50) NOT NULL,
     provider VARCHAR(100),
-
     status VARCHAR(30) NOT NULL,
-
     risk_score NUMERIC(18,8),
-
     decision VARCHAR(30),
-
     provider_reference VARCHAR(200),
-
     result JSONB,
-
     created_at TIMESTAMPTZ NOT NULL,
 
-    FOREIGN KEY(transaction_id)
-        REFERENCES custody_transaction(id)
+    FOREIGN KEY(transaction_id) REFERENCES custody_transaction(id)
 );
 ```
 
-Do not store unnecessary sensitive personal information.
+Do not store unnecessary sensitive personal information. For local dev, this provider is a WireMock stub (§37) — no real AML vendor is called.
 
 ---
 
-# 19. Policy Decision
+## 19. Policy Decision
 
 ```sql
 CREATE TABLE policy_decision (
     id UUID PRIMARY KEY,
-
     transaction_id UUID NOT NULL,
-
     decision VARCHAR(30) NOT NULL,
-
     rules JSONB NOT NULL,
-
     decided_at TIMESTAMPTZ NOT NULL,
 
-    FOREIGN KEY(transaction_id)
-        REFERENCES custody_transaction(id)
+    FOREIGN KEY(transaction_id) REFERENCES custody_transaction(id)
 );
 ```
 
-Decision:
-
-```text
-ALLOW
-DENY
-REVIEW
-```
+Decision: `ALLOW`, `DENY`, `REVIEW`.
 
 ---
 
-# 20. Provider Event
+## 20. Provider Event
 
 ```sql
 CREATE TABLE provider_event (
     id UUID PRIMARY KEY,
-
     provider VARCHAR(50) NOT NULL,
     provider_event_id VARCHAR(200) NOT NULL,
     event_type VARCHAR(100) NOT NULL,
-
     payload JSONB NOT NULL,
-
     status VARCHAR(30) NOT NULL,
-
     received_at TIMESTAMPTZ NOT NULL,
     processed_at TIMESTAMPTZ,
 
@@ -750,124 +796,81 @@ This provides webhook/event idempotency.
 
 ---
 
-# 21. Outbox
-
-Use a transactional outbox.
+## 21. Outbox
 
 ```sql
 CREATE TABLE outbox_event (
     id UUID PRIMARY KEY,
-
     aggregate_type VARCHAR(100) NOT NULL,
     aggregate_id UUID NOT NULL,
-
     event_type VARCHAR(100) NOT NULL,
-
     payload JSONB NOT NULL,
-
     status VARCHAR(30) NOT NULL,
-
     created_at TIMESTAMPTZ NOT NULL,
     published_at TIMESTAMPTZ
 );
 ```
 
-The database transaction must update the domain state AND create the outbox event atomically.
+The database transaction must update the domain state AND create the outbox event atomically. Locally, this row is what the §5.4 Option A poller reads — the correctness of *this* table/transaction is what actually matters for MVP; which broker eventually reads from it (none, emulator, or real Azure Service Bus) is a swappable detail behind `EventPublisher`.
 
 ---
 
-# 22. Reconciliation
+## 22. Reconciliation
 
 ```sql
 CREATE TABLE reconciliation_result (
     id UUID PRIMARY KEY,
-
     asset_id UUID NOT NULL,
     network_id UUID NOT NULL,
-
     bank_balance NUMERIC(38,18) NOT NULL,
     provider_balance NUMERIC(38,18) NOT NULL,
-
     difference NUMERIC(38,18) NOT NULL,
-
     status VARCHAR(30) NOT NULL,
-
     reconciliation_time TIMESTAMPTZ NOT NULL,
 
-    FOREIGN KEY(asset_id)
-        REFERENCES asset(id),
-
-    FOREIGN KEY(network_id)
-        REFERENCES network(id)
+    FOREIGN KEY(asset_id) REFERENCES asset(id),
+    FOREIGN KEY(network_id) REFERENCES network(id)
 );
 ```
 
-Statuses:
-
-```text
-MATCH
-BREAK
-ERROR
-```
+Statuses: `MATCH`, `BREAK`, `ERROR`.
 
 ---
 
-# 23. Audit
-
-Create an append-only audit table.
+## 23. Audit
 
 ```sql
 CREATE TABLE audit_event (
     id UUID PRIMARY KEY,
-
     actor_type VARCHAR(50) NOT NULL,
     actor_id VARCHAR(200),
-
     action VARCHAR(100) NOT NULL,
-
     resource_type VARCHAR(100) NOT NULL,
     resource_id VARCHAR(200),
-
     correlation_id VARCHAR(200),
-
     data JSONB,
-
     created_at TIMESTAMPTZ NOT NULL
 );
 ```
 
-Audit:
-
-- account creation
-- address creation
-- deposit
-- withdrawal
-- policy decision
-- AML decision
-- funds reservation
-- Fireblocks submission
-- transaction status changes
-- reconciliation
-- freeze/unfreeze
+Audit: account creation, address creation, deposit, withdrawal, policy decision, AML decision, funds reservation, Fireblocks submission, transaction status changes, reconciliation, freeze/unfreeze.
 
 Never log private keys or secrets.
 
 ---
 
-# 24. Step 5 — Domain Enums
-
-Create enums.
+## 24. Step 5 — Domain Enums
 
 ```text
 CustodyAccountStatus
 AssetStatus
 NetworkStatus
+AssetNetworkStatus
 TransactionType
 TransactionStatus
-PositionStatus
-PolicyDecision
-ComplianceDecision
 WalletStatus
+ComplianceDecision
+PolicyDecision
 ReconciliationStatus
 AuditAction
 ```
@@ -876,21 +879,17 @@ Do not scatter raw strings throughout the application.
 
 ---
 
-# 25. Step 6 — Custody Account API
-
-Implement:
+## 25. Step 6 — Custody Account API
 
 ```http
 POST /v1/custody-accounts
 GET  /v1/custody-accounts/{id}
 ```
 
-Create account:
+Create account request:
 
 ```json
-{
-  "customerId": "C12345"
-}
+{ "customerId": "C12345" }
 ```
 
 Response:
@@ -903,15 +902,11 @@ Response:
 }
 ```
 
-The customer identity must come from the bank's identity/customer system where possible.
-
-Do not build a second customer master.
+For MVP local dev, `customerId` can be an arbitrary string you pass in manually — real bank customer-master integration is a later step. Do not build a second customer master even for MVP; treat `customerId` as a foreign reference, not a place to store customer attributes.
 
 ---
 
-# 26. Step 7 — Position API
-
-Implement:
+## 26. Step 7 — Position API
 
 ```http
 GET /v1/custody-accounts/{id}/positions
@@ -934,59 +929,32 @@ Response:
 }
 ```
 
-The API must calculate total consistently.
-
-Do not allow clients to directly modify positions.
+`total = available + locked + pending`, computed in the read path — never stored as a separate mutable column. Do not allow clients to directly modify positions.
 
 ---
 
-# 27. Step 8 — Fireblocks Adapter
-
-Create an interface:
+## 27. Step 8 — Fireblocks Adapter
 
 ```java
 public interface CustodyExecutionProvider {
-
-    ProviderWallet getWallet(
-        Asset asset,
-        Network network,
-        UUID custodyAccountId
-    );
-
-    ProviderAddress getDepositAddress(
-        WalletReference wallet,
-        Asset asset,
-        Network network
-    );
-
-    ProviderTransaction submitWithdrawal(
-        WithdrawalExecutionRequest request
-    );
-
-    ProviderTransaction getTransaction(
-        String providerTransactionId
-    );
-
+    ProviderWallet getWallet(Asset asset, Network network, UUID custodyAccountId);
+    ProviderAddress getDepositAddress(WalletReference wallet, Asset asset, Network network);
+    ProviderTransaction submitWithdrawal(WithdrawalExecutionRequest request);
+    ProviderTransaction getTransaction(String providerTransactionId);
     List<ProviderBalance> getBalances();
 }
 ```
 
-Then implement:
-
 ```java
 @Component
-public class FireblocksExecutionProvider
-        implements CustodyExecutionProvider {
-}
+public class FireblocksExecutionProvider implements CustodyExecutionProvider { }
 ```
 
-The rest of the application must depend only on the interface.
+The rest of the application must depend only on the interface. This is what makes local testing possible without hitting real Fireblocks: implement a second `WireMockExecutionProvider`-friendly config (i.e. point `FireblocksExecutionProvider` at a local WireMock server via `FIREBLOCKS_BASE_PATH`) for fast local iteration, and the real Fireblocks **sandbox** tenant for end-to-end verification before any production conversation.
 
 ---
 
-# 28. Step 9 — Fireblocks API Client
-
-Create:
+## 28. Step 9 — Fireblocks API Client
 
 ```text
 FireblocksClient
@@ -997,19 +965,13 @@ FireblocksWebhookController
 FireblocksWebhookProcessor
 ```
 
-Keep all Fireblocks-specific DTOs inside the `fireblocks` module.
+Keep all Fireblocks-specific DTOs inside the `fireblocks` module. Do not use Fireblocks DTOs in the core domain. Use the Fireblocks tenant/developer documentation as the authoritative source for authentication, request signing, endpoint names, asset identifiers, transaction parameters and webhook formats. Do not hard-code undocumented assumptions.
 
-Do not use Fireblocks DTOs in the core domain.
-
-Use the Fireblocks tenant/developer documentation as the authoritative source for the exact API authentication, request signing, endpoint names, asset identifiers, transaction parameters and webhook formats.
-
-Do not hard-code undocumented Fireblocks API assumptions.
+**Local webhook delivery:** Fireblocks sandbox needs a publicly reachable URL to deliver webhooks to your local machine. Use a tunnel (e.g. `ngrok http 8080`) pointed at `/v1/internal/providers/fireblocks/events`, or — for pure offline development — skip live webhooks entirely and drive the deposit lifecycle (§32) from a test harness that inserts synthetic `provider_event` rows / calls the webhook controller directly with fixture payloads.
 
 ---
 
-# 29. Step 10 — Deposit Address
-
-API:
+## 29. Step 10 — Deposit Address
 
 ```http
 POST /v1/custody-accounts/{accountId}/deposit-addresses
@@ -1018,10 +980,7 @@ POST /v1/custody-accounts/{accountId}/deposit-addresses
 Request:
 
 ```json
-{
-  "asset": "BTC",
-  "network": "BITCOIN"
-}
+{ "asset": "BTC", "network": "BITCOIN" }
 ```
 
 Flow:
@@ -1051,13 +1010,13 @@ The API must be idempotent for the same account/asset/network.
 
 ---
 
-# 30. Step 11 — Fireblocks Webhook
-
-Create:
+## 30. Step 11 — Fireblocks Webhook
 
 ```http
-POST /internal/providers/fireblocks/events
+POST /v1/internal/providers/fireblocks/events
 ```
+
+> Keep this under the same `/v1` prefix as the rest of the app, but exclude it from any future public-facing gateway (see §54, Appendix B).
 
 The webhook endpoint must:
 
@@ -1066,66 +1025,48 @@ The webhook endpoint must:
 3. Generate correlation ID
 4. Store `provider_event`
 5. Reject duplicate provider event IDs safely
-6. Publish an internal event
+6. Publish an internal event (via `EventPublisher`, §5.4)
 7. Return quickly
 
 Do NOT execute a long transaction workflow synchronously in the HTTP webhook.
 
 ---
 
-# 31. Step 12 — Azure Service Bus
+## 31. Step 12 — Local Event Publishing
 
-Use:
+Replaces the Azure-only "Service Bus setup" step. Implement the `EventPublisher` interface from §5.4 and wire it by profile:
 
-```text
-fireblocks-events
-custody-events
+```yaml
+# application-local.yml
+messaging:
+  mode: local   # or servicebus-emulator
 ```
 
-At minimum.
-
-Flow:
-
 ```text
-Fireblocks
+Fireblocks / domain event
    |
    v
-Webhook
+outbox_event (row written in same DB transaction as domain change)
    |
    v
-provider_event
+Outbox poller (@Scheduled)
    |
    v
-Azure Service Bus
+EventPublisher.publish(event)
    |
-   v
-Event Processor
+   +-- mode=local --> LocalLoggingEventPublisher (logs, marks PUBLISHED)
+   |
+   +-- mode=servicebus-emulator --> ServiceBusEventPublisher (real AMQP call to emulator container)
 ```
 
-Configure retries and dead-letter queues.
-
-Never silently discard failed events.
+Configure retry-with-backoff in the poller and a `FAILED`/dead-letter status on `outbox_event` after N attempts. Never silently discard failed events — this rule doesn't change just because there's no Azure Service Bus locally.
 
 ---
 
-# 32. Step 13 — Deposit Lifecycle
-
-Implement:
+## 32. Step 13 — Deposit Lifecycle
 
 ```text
-DEPOSIT_DETECTED
-        |
-        v
-SCREENING
-        |
-        v
-PENDING_CONFIRMATION
-        |
-        v
-CONFIRMED
-        |
-        v
-POSTED
+DEPOSIT_DETECTED -> SCREENING -> PENDING_CONFIRMATION -> CONFIRMED -> POSTED
 ```
 
 Processing:
@@ -1152,35 +1093,19 @@ Update position
 Emit DepositPosted
 ```
 
-Unknown addresses must go to an exception state.
-
-Never automatically credit an unidentified client account.
+Unknown addresses must go to an exception state. Never automatically credit an unidentified client account.
 
 ---
 
-# 33. Step 14 — Ledger Deposit Posting
+## 33. Step 14 — Ledger Deposit Posting
 
-Example:
-
-Client receives 1 BTC.
-
-Create an immutable ledger entry representing the client credit.
-
-Update position transactionally:
-
-```text
-available += 1 BTC
-```
-
-The ledger entry and position update must be in the same PostgreSQL transaction.
+Client receives 1 BTC → create an immutable ledger entry representing the client credit → update position transactionally (`available += 1 BTC`) in the **same** PostgreSQL transaction as the ledger insert.
 
 Use an idempotency key derived from the unique provider transaction/event identity.
 
 ---
 
-# 34. Step 15 — Withdrawal API
-
-Implement:
+## 34. Step 15 — Withdrawal API
 
 ```http
 POST /v1/custody-accounts/{accountId}/withdrawals
@@ -1207,109 +1132,41 @@ The same idempotency key must not create two withdrawals.
 
 ---
 
-# 35. Step 16 — Withdrawal State Machine
-
-Implement:
+## 35. Step 16 — Withdrawal State Machine
 
 ```text
-REQUESTED
-   |
-   v
-VALIDATING
-   |
-   v
-SCREENING
-   |
-   v
-POLICY_PENDING
-   |
-   +--> DENIED
-   |
-   v
-APPROVED
-   |
-   v
-FUNDS_RESERVED
-   |
-   v
-SUBMITTING
-   |
-   v
-SUBMITTED
-   |
-   v
-CONFIRMING
-   |
-   v
-SETTLED
+REQUESTED -> VALIDATING -> SCREENING -> POLICY_PENDING -> (DENIED | APPROVED)
+APPROVED -> FUNDS_RESERVED -> SUBMITTING -> SUBMITTED -> CONFIRMING -> SETTLED
 ```
 
-Failure states:
-
-```text
-REJECTED
-CANCELLED
-FAILED
-```
-
-Do not collapse all failure scenarios into one state.
+Failure states: `REJECTED`, `CANCELLED`, `FAILED`. Do not collapse all failure scenarios into one state.
 
 ---
 
-# 36. Step 17 — Withdrawal Validation
+## 36. Step 17 — Withdrawal Validation
 
-Validate:
+Validate: account exists and is ACTIVE; asset ACTIVE; network ACTIVE; asset/network approved; amount > 0 and respects asset decimals; destination address valid for the network; sufficient available position; account not frozen; withdrawal limits; AML/sanctions/risk; policy.
 
-1. Account exists
-2. Account is ACTIVE
-3. Asset is ACTIVE
-4. Network is ACTIVE
-5. Asset/network combination is approved
-6. Amount > 0
-7. Amount respects asset decimals
-8. Destination address is valid for the selected network
-9. Client has sufficient available position
-10. Account is not frozen
-11. Withdrawal limits
-12. AML/sanctions/risk
-13. Policy
-
-Do not trust the product caller to perform these checks.
-
-Custody must enforce them.
+Do not trust the product caller to perform these checks. Custody must enforce them.
 
 ---
 
-# 37. Step 18 — AML Integration
-
-Create an interface:
+## 37. Step 18 — AML Integration
 
 ```java
 public interface ComplianceProvider {
-
-    ScreeningResult screenWithdrawal(
-        ComplianceRequest request
-    );
-
-    ScreeningResult screenDeposit(
-        ComplianceRequest request
-    );
+    ScreeningResult screenWithdrawal(ComplianceRequest request);
+    ScreeningResult screenDeposit(ComplianceRequest request);
 }
 ```
 
-Implement an adapter for the bank's existing AML/blockchain intelligence provider.
+For local dev, implement `WireMockComplianceProvider` (or a `StubComplianceProvider` returning configurable canned decisions) so the withdrawal/deposit flow is fully testable without a live AML vendor connection. Swap in the bank's real AML/blockchain intelligence adapter later — the interface doesn't change.
 
-Do not hard-code a particular AML vendor into the custody domain.
-
-The provider supplies intelligence.
-
-The bank policy engine makes the final custody decision.
+Do not hard-code a particular AML vendor into the custody domain. The provider supplies intelligence; the bank policy engine makes the final custody decision.
 
 ---
 
-# 38. Step 19 — Policy Engine
-
-Implement an MVP policy engine.
+## 38. Step 19 — Policy Engine
 
 Minimum rules:
 
@@ -1331,18 +1188,9 @@ Return:
 {
   "decision": "ALLOW",
   "rules": [
-    {
-      "name": "ACCOUNT_ACTIVE",
-      "result": "PASS"
-    },
-    {
-      "name": "AMOUNT_LIMIT",
-      "result": "PASS"
-    },
-    {
-      "name": "AML",
-      "result": "PASS"
-    }
+    { "name": "ACCOUNT_ACTIVE", "result": "PASS" },
+    { "name": "AMOUNT_LIMIT", "result": "PASS" },
+    { "name": "AML", "result": "PASS" }
   ]
 }
 ```
@@ -1351,354 +1199,142 @@ Persist the decision.
 
 ---
 
-# 39. Step 20 — Funds Reservation
-
-Before Fireblocks submission:
+## 39. Step 20 — Funds Reservation
 
 ```text
 available -= amount
 locked += amount
 ```
 
-Do this atomically with the ledger reservation entries.
-
-Use PostgreSQL locking:
+Atomic with the ledger reservation entries. Use PostgreSQL locking:
 
 ```sql
-SELECT *
-FROM position
-WHERE custody_account_id = ?
-  AND asset_id = ?
+SELECT * FROM position
+WHERE custody_account_id = ? AND asset_id = ?
 FOR UPDATE;
 ```
 
-Then validate balance and update.
-
-Never submit a withdrawal to Fireblocks before funds are successfully reserved.
+Then validate balance and update. Never submit a withdrawal to Fireblocks before funds are successfully reserved.
 
 ---
 
-# 40. Step 21 — Fireblocks Withdrawal
-
-After successful reservation:
+## 40. Step 21 — Fireblocks Withdrawal
 
 ```text
-Transaction
-    |
-    v
-Fireblocks Adapter
-    |
-    v
-Fireblocks
-    |
-    v
-Signing/MPC
-    |
-    v
-Blockchain
+Transaction -> Fireblocks Adapter -> Fireblocks -> Signing/MPC (per §0.1) -> Blockchain
 ```
 
-Store the provider transaction ID.
-
-Never use the provider transaction ID as your bank transaction ID.
-
-You own:
-
-```text
-custody_transaction.id
-```
-
-and map:
-
-```text
-custody_transaction.provider_transaction_id
-```
+Store the provider transaction ID. Never use it as your bank transaction ID — you own `custody_transaction.id` and map `custody_transaction.provider_transaction_id`.
 
 ---
 
-# 41. Step 22 — Transaction Status Events
+## 41. Step 22 — Transaction Status Events
 
-Process provider updates:
-
-```text
-SUBMITTED
-BROADCAST
-CONFIRMING
-COMPLETED
-FAILED
-```
-
-Map provider-specific statuses into your internal statuses.
-
-Do not expose Fireblocks-specific statuses to bank products.
+Process provider updates: `SUBMITTED`, `BROADCAST`, `CONFIRMING`, `COMPLETED`, `FAILED`. Map provider-specific statuses into internal statuses. Do not expose Fireblocks-specific statuses to bank products.
 
 ---
 
-# 42. Step 23 — Withdrawal Settlement
+## 42. Step 23 — Withdrawal Settlement
 
-When successfully settled:
+Settled: `locked -= amount`, create the final immutable ledger entry.
 
-```text
-locked -= amount
-```
-
-The total client position decreases.
-
-Create the final immutable ledger entry.
-
-If a transaction fails after reservation:
-
-```text
-locked -= amount
-available += amount
-```
-
-and create compensating ledger entries.
-
-Never simply delete the original reservation.
+Failed after reservation: `locked -= amount`, `available += amount`, create compensating ledger entries. Never simply delete the original reservation.
 
 ---
 
-# 43. Step 24 — Reconciliation
+## 43. Step 24 — Reconciliation
 
-Run scheduled reconciliation.
+Run scheduled reconciliation locally via `@Scheduled` (no Azure Function needed for MVP — a simple cron-style scheduled method in the Spring app is sufficient).
 
-MVP frequency:
+MVP frequency: at least daily; more frequently for operational monitoring during development.
 
-- at least daily
-- preferably more frequently for operational monitoring
+Compare bank client positions vs. Fireblocks (sandbox) wallet balances per asset/network.
 
-Compare:
-
-```text
-Bank client positions
-        vs
-Fireblocks wallet balances
-```
-
-For each asset/network.
-
-Expected invariant:
-
-```text
-Sum(client positions)
-<=
-Controlled custody assets
-```
-
-The exact treatment of fees, operational wallets, pending transactions and omnibus balances must be explicitly configured.
-
-Do not assume the two totals must always be identical at every instant.
+Expected invariant: `Sum(client positions) <= Controlled custody assets`. The exact treatment of fees, operational wallets, pending transactions and omnibus balances must be explicitly configured. Do not assume the two totals must always be identical at every instant.
 
 ---
 
-# 44. Step 25 — Reconciliation Break Handling
+## 44. Step 25 — Reconciliation Break Handling
 
-If:
-
-```text
-bank balance != provider balance
-```
-
-create:
-
-```text
-RECONCILIATION BREAK
-```
-
-Do NOT automatically modify the client ledger to force a match.
-
-Create an operational exception.
-
-Require investigation/resolution.
+If `bank balance != provider balance`, create a `RECONCILIATION BREAK`. Do NOT automatically modify the client ledger to force a match. Create an operational exception requiring investigation/resolution.
 
 ---
 
-# 45. Step 26 — API Security
+## 45. Step 26 — API Security (local)
 
-All product APIs must use bank-standard authentication.
+For MVP local dev, implement a simple stateless JWT filter (self-issued tokens, e.g. via a `/v1/dev/token` endpoint gated behind the `local` profile only) so authorization logic (§45.1) can be built and tested without a real IAM/OIDC provider. Do **not** ship the dev-token endpoint outside the `local` profile.
 
-Recommended:
-
-```text
-OAuth2/OIDC
-JWT
-mTLS where required
-```
-
-Authorization must be enforced by custody account/customer entitlement.
-
-Example:
+Authorization must still be enforced by custody account/customer entitlement regardless of how authentication is wired:
 
 ```text
-Product A
-    |
-    v
-Can access CA123?
-    |
-    +-- NO --> 403
-    |
-    +-- YES --> continue
+Product A -> Can access CA123? -> NO --> 403 / YES --> continue
 ```
 
-Do not rely solely on API gateway authorization.
+Do not rely solely on gateway-level authorization. Real bank IAM (OAuth2/OIDC, mTLS) integration is an Appendix B / later-phase concern — keep the authorization logic decoupled from the authentication mechanism so swapping it in later doesn't touch the entitlement checks.
 
 ---
 
-# 46. Step 27 — Idempotency
+## 46. Step 27 — Idempotency
 
-Every mutating API must support idempotency.
-
-Minimum:
+Every mutating API must support idempotency. Minimum:
 
 ```text
-POST /withdrawals
-POST /deposit-addresses
-POST /custody-accounts
+POST /v1/custody-accounts
+POST /v1/custody-accounts/{accountId}/deposit-addresses
+POST /v1/custody-accounts/{accountId}/withdrawals
 ```
-
-Use:
 
 ```http
 Idempotency-Key: UUID
 ```
 
-Persist the key and resulting resource.
-
-Same key + same request:
-
-```text
-return original result
-```
-
-Same key + different request:
-
-```text
-409 CONFLICT
-```
+Persist the key and resulting resource. Same key + same request → return original result. Same key + different request → `409 CONFLICT`.
 
 ---
 
-# 47. Step 28 — Concurrency
+## 47. Step 28 — Concurrency
 
-The most important concurrency control is position reservation.
+Never do `position.getAvailable(); position.setAvailable(...); repository.save();` without concurrency protection.
 
-Never do:
-
-```java
-position.getAvailable()
-position.setAvailable(...)
-repository.save()
-```
-
-without concurrency protection.
-
-Use:
-
-- PostgreSQL row locks
-- optimistic versioning
-- serializable/appropriate transaction boundaries
-
-The selected approach must be tested with concurrent withdrawal requests.
+Use PostgreSQL row locks (`SELECT ... FOR UPDATE`) and/or optimistic versioning (`position.version`). Test with concurrent withdrawal requests locally (§71) — Testcontainers makes this fully reproducible without any cloud dependency.
 
 ---
 
-# 48. Step 29 — Outbox Processing
-
-When domain state changes:
+## 48. Step 29 — Outbox Processing
 
 ```text
-DB transaction:
-
-1. Update position
-2. Insert ledger entry
-3. Update transaction
-4. Insert outbox event
+DB transaction: 1. Update position  2. Insert ledger entry  3. Update transaction  4. Insert outbox event
 ```
 
-Then:
-
-```text
-Outbox processor
-   |
-   v
-Azure Service Bus
-```
-
-Events may be delivered more than once.
-
-Consumers must be idempotent.
+Then the local poller (§31) or emulator picks it up. Events may be delivered more than once — consumers must be idempotent regardless of which `EventPublisher` implementation is active.
 
 ---
 
-# 49. Step 30 — Observability
+## 49. Step 30 — Observability (local)
 
-Every request/event must have:
+Every request/event must have a `correlation_id`. Locally, Actuator + structured console logging (JSON via `logstash-logback-encoder` or similar) is sufficient — ship to a real log aggregator only when you get to Appendix B.
 
-```text
-correlation_id
-```
+Audit chain: API request → custody transaction → policy decision → AML screening → fund reservation → Fireblocks provider transaction → blockchain transaction hash → settlement → reconciliation.
 
-For a withdrawal, the audit chain should connect:
-
-```text
-API request
-   |
-custody transaction
-   |
-policy decision
-   |
-AML screening
-   |
-fund reservation
-   |
-Fireblocks provider transaction
-   |
-blockchain transaction hash
-   |
-settlement
-   |
-reconciliation
-```
-
-Never log:
-
-- private keys
-- authentication secrets
-- access tokens
-- sensitive personal information unnecessarily
+Never log private keys, authentication secrets, access tokens, or unnecessary personal information.
 
 ---
 
-# 50. Step 31 — Error Handling
-
-Use consistent HTTP errors.
-
-Examples:
+## 50. Step 31 — Error Handling
 
 ```text
-400 INVALID_REQUEST
-401 UNAUTHENTICATED
-403 NOT_AUTHORIZED
-404 NOT_FOUND
-409 IDEMPOTENCY_CONFLICT
-409 INSUFFICIENT_FUNDS
-409 ACCOUNT_FROZEN
-422 POLICY_REJECTED
-422 AML_REJECTED
-422 UNSUPPORTED_ASSET
-422 INVALID_ADDRESS
-500 INTERNAL_ERROR
-503 PROVIDER_UNAVAILABLE
+400 INVALID_REQUEST          409 IDEMPOTENCY_CONFLICT     422 POLICY_REJECTED
+401 UNAUTHENTICATED          409 INSUFFICIENT_FUNDS        422 AML_REJECTED
+403 NOT_AUTHORIZED           409 ACCOUNT_FROZEN             422 UNSUPPORTED_ASSET
+404 NOT_FOUND                                                422 INVALID_ADDRESS
+500 INTERNAL_ERROR           503 PROVIDER_UNAVAILABLE
 ```
 
 Do not leak provider-specific errors to consumers.
 
 ---
 
-# 51. Step 32 — Health Checks
-
-Expose:
+## 51. Step 32 — Health Checks
 
 ```text
 /actuator/health
@@ -1706,160 +1342,68 @@ Expose:
 /actuator/metrics
 ```
 
-Health checks should include:
-
-- PostgreSQL
-- Azure Service Bus where appropriate
-- Fireblocks connectivity
-- Key Vault availability where appropriate
-
-Do not expose secrets or sensitive dependency details.
+Local health checks should cover: PostgreSQL, Fireblocks connectivity (sandbox or WireMock), and — if Option B is active — the Service Bus emulator. Do not expose secrets or sensitive dependency details.
 
 ---
 
-# 52. Step 33 — Testing Strategy
+## 52. Step 33 — Testing Strategy
 
-The MVP is not complete without automated tests.
+### Unit tests
+Ledger calculations, position reservation, policy rules, transaction state transitions, idempotency, asset/network validation.
 
-## Unit tests
+### Integration tests
+Testcontainers **PostgreSQL 16**. Test: ledger transaction, concurrent withdrawal, outbox, Liquibase changelog application, reconciliation.
 
-Test:
+### Provider tests
+WireMock. Test: Fireblocks success, timeout, 4xx, 5xx, duplicate event, malformed event, transaction status updates.
 
-- ledger calculations
-- position reservation
-- policy rules
-- transaction state transitions
-- idempotency
-- asset/network validation
-
-## Integration tests
-
-Use Testcontainers PostgreSQL.
-
-Test:
-
-- ledger transaction
-- concurrent withdrawal
-- outbox
-- Flyway
-- reconciliation
-
-## Provider tests
-
-Use WireMock or equivalent.
-
-Test:
-
-- Fireblocks success
-- Fireblocks timeout
-- Fireblocks 4xx
-- Fireblocks 5xx
-- duplicate event
-- malformed event
-- transaction status updates
-
-## End-to-end
-
-Test:
-
+### End-to-end (fully local, no Azure/live Fireblocks required)
 ```text
-Create account
-  -> create address
-  -> simulate deposit
-  -> credit position
-  -> request withdrawal
-  -> AML
-  -> policy
-  -> reserve
-  -> Fireblocks mock
-  -> settlement
-  -> reconcile
+Create account -> create address -> simulate deposit (fixture provider_event or WireMock)
+  -> credit position -> request withdrawal -> AML (stub) -> policy -> reserve
+  -> Fireblocks mock -> settlement -> reconcile
 ```
 
 ---
 
-# 53. Step 34 — Mandatory Security Tests
+## 53. Step 34 — Mandatory Security Tests
 
-Test:
-
-- unauthorized account access
-- cross-customer access
-- replayed idempotency key
-- duplicate webhook
-- forged webhook
-- malformed provider payload
-- negative amounts
-- excessive precision
-- unsupported network
-- unsupported asset
-- frozen account withdrawal
-- concurrent withdrawals
-- duplicate settlement
-- provider timeout
-- provider transaction mismatch
+Unauthorized account access, cross-customer access, replayed idempotency key, duplicate webhook, forged webhook, malformed provider payload, negative amounts, excessive precision, unsupported network, unsupported asset, frozen account withdrawal, concurrent withdrawals, duplicate settlement, provider timeout, provider transaction mismatch.
 
 ---
 
-# 54. Step 35 — MVP API Contract
-
-Expose:
+## 54. Step 35 — MVP API Contract
 
 ```http
 POST /v1/custody-accounts
-
-GET /v1/custody-accounts/{accountId}
-
-GET /v1/custody-accounts/{accountId}/positions
-
-GET /v1/custody-accounts/{accountId}/transactions
-
+GET  /v1/custody-accounts/{accountId}
+GET  /v1/custody-accounts/{accountId}/positions
+GET  /v1/custody-accounts/{accountId}/transactions
 POST /v1/custody-accounts/{accountId}/deposit-addresses
-
-GET /v1/custody-accounts/{accountId}/deposit-addresses
-
+GET  /v1/custody-accounts/{accountId}/deposit-addresses
 POST /v1/custody-accounts/{accountId}/withdrawals
-
-GET /v1/withdrawals/{transactionId}
-
-GET /v1/deposits/{transactionId}
-
-GET /v1/assets
-
-GET /v1/assets/{asset}/networks
+GET  /v1/withdrawals/{transactionId}
+GET  /v1/deposits/{transactionId}
+GET  /v1/assets
+GET  /v1/assets/{asset}/networks
 ```
 
-Internal endpoint:
+Internal endpoint (never expose through a public gateway, later or now):
 
 ```http
-POST /internal/providers/fireblocks/events
+POST /v1/internal/providers/fireblocks/events
 ```
-
-Do not expose internal provider endpoints through the public product API.
 
 ---
 
-# 55. Step 36 — MVP Events
-
-Publish:
+## 55. Step 36 — MVP Events
 
 ```text
-CustodyAccountCreated
-DepositDetected
-DepositConfirmed
-DepositPosted
-WithdrawalRequested
-WithdrawalApproved
-WithdrawalRejected
-FundsReserved
-WithdrawalSubmitted
-WithdrawalConfirmed
-WithdrawalFailed
-PositionChanged
-ReconciliationMatched
-ReconciliationBreakDetected
+CustodyAccountCreated, DepositDetected, DepositConfirmed, DepositPosted,
+WithdrawalRequested, WithdrawalApproved, WithdrawalRejected, FundsReserved,
+WithdrawalSubmitted, WithdrawalConfirmed, WithdrawalFailed, PositionChanged,
+ReconciliationMatched, ReconciliationBreakDetected
 ```
-
-Events should include:
 
 ```json
 {
@@ -1876,428 +1420,199 @@ Never put secrets into events.
 
 ---
 
-# 56. Step 37 — MVP Operational Controls
+## 56. Step 37 — MVP Operational Controls
 
-Provide basic operational capabilities:
-
-- transaction search
-- transaction status
-- account status
-- position lookup
-- reconciliation status
-- failed transaction visibility
-- provider outage visibility
-- webhook/event failure visibility
-- dead-letter visibility
-
-A full operations UI is out of scope.
-
-These can initially be exposed through secure APIs/logging/monitoring.
+Transaction search, transaction status, account status, position lookup, reconciliation status, failed transaction visibility, provider outage visibility, webhook/event failure visibility, dead-letter/failed-outbox visibility. A full ops UI is out of scope — expose via secure APIs/logging locally (Actuator + `outbox_event`/`provider_event` query endpoints are enough for MVP).
 
 ---
 
-# 57. Step 38 — Freeze Controls
+## 57. Step 38 — Freeze Controls
 
-Support account freeze.
-
-When:
-
-```text
-custody_account.status = FROZEN
-```
-
-then:
-
-- withdrawals are rejected
-- new outbound transactions cannot be created
-- existing transactions follow defined incident policy
-- deposits may still be accepted only if explicitly permitted by policy
-
-Do not hard-code the operational treatment of in-flight transactions.
+`custody_account.status = FROZEN` → withdrawals rejected, no new outbound transactions, existing transactions follow defined incident policy, deposits only if explicitly permitted by policy. Do not hard-code the treatment of in-flight transactions.
 
 ---
 
-# 58. Step 39 — Asset/Network Kill Switch
+## 58. Step 39 — Asset/Network Kill Switch
 
-Provide configuration to suspend an asset/network:
-
-```text
-BTC / Bitcoin = ACTIVE
-
-USDC / Ethereum = SUSPENDED
-```
-
-When suspended:
-
-- new deposit addresses may be blocked
-- withdrawals blocked
-- new transactions blocked
-
-Existing positions remain visible.
-
-This is an important operational safety control.
+Suspend an asset/network (e.g. `USDC/Ethereum = SUSPENDED`) → new deposit addresses/withdrawals/new transactions blocked; existing positions remain visible. Important operational safety control, and fully testable locally by flipping the `asset_network.status` row.
 
 ---
 
-# 59. Step 40 — Fireblocks Isolation
+## 59. Step 40 — Fireblocks Isolation
 
-All Fireblocks code must live under:
-
-```text
-com.bank.custody.fireblocks
-```
-
-Core domain must not import:
-
-```text
-com.fireblocks.*
-```
-
-except inside the adapter/integration layer.
-
-This is mandatory for vendor portability.
+All Fireblocks code lives under `com.bank.custody.fireblocks`. Core domain must not import `com.fireblocks.*` outside the adapter layer. Mandatory for vendor portability, and it's also what makes local WireMock-based testing (§27) drop-in simple.
 
 ---
 
-# 60. Step 41 — Configuration Model
+## 60. Step 41 — Configuration Model
 
-MVP configuration should include:
-
-```text
-Supported assets
-Supported networks
-Asset/network combinations
-Withdrawal limits
-Deposit confirmation policy
-Account status policy
-Provider configuration
-AML thresholds
-Policy rules
-```
-
-Do not hard-code these in Java.
-
-Use approved configuration storage.
-
-For MVP, database-backed configuration is acceptable if properly secured/audited.
+Supported assets/networks/combinations, withdrawal limits, deposit confirmation policy, account status policy, provider configuration, AML thresholds, policy rules. Do not hard-code in Java. Database-backed configuration is acceptable for MVP if audited (§23).
 
 ---
 
-# 61. Step 42 — Blockchain Confirmation
+## 61. Step 42 — Blockchain Confirmation
 
-Do not assume:
-
-```text
-provider says transaction submitted
-=
-client deposit/withdrawal settled
-```
-
-Define a clear settlement rule.
-
-For MVP:
-
-```text
-Submitted
-    !=
-Settled
-```
-
-Settlement requires the configured confirmation/finality condition.
-
-The exact confirmation policy must be configurable per network.
+`Submitted != Settled`. Settlement requires the configured confirmation/finality condition, configurable per network. For local testing against Fireblocks sandbox/testnets, confirmation counts can be set low (e.g. 1) to keep iteration fast — document this clearly as a **non-production** setting.
 
 ---
 
-# 62. Step 43 — Fees
+## 62. Step 43 — Fees
 
-Keep fee handling minimal for MVP.
-
-Support:
-
-```text
-network/provider fee
-```
-
-if required by the bank's Fireblocks configuration.
-
-Do not build a sophisticated fee engine.
-
-However, preserve enough transaction data to distinguish:
-
-```text
-requested amount
-executed amount
-network fee
-provider fee
-client debit
-```
-
-before going to production.
+Keep minimal for MVP. Support `network/provider fee` if the sandbox config requires it. Preserve enough transaction data to distinguish: requested amount, executed amount, network fee, provider fee, client debit — before going to production.
 
 ---
 
-# 63. Step 44 — Decimal Handling
+## 63. Step 44 — Decimal Handling
 
-Every asset has its own decimals.
-
-Example:
-
-```text
-BTC = 8
-ETH = 18
-```
-
-The application must reject amounts with unsupported precision.
-
-Use:
-
-```java
-BigDecimal
-```
-
-and normalize using the asset's configured decimal precision.
-
-Never use floating-point arithmetic.
+Every asset has its own decimals (`BTC = 8`, `ETH = 18`). Reject amounts with unsupported precision. Use `BigDecimal`, normalized to the asset's configured decimal precision. Never use floating-point arithmetic.
 
 ---
 
-# 64. Step 45 — API Versioning
+## 64. Step 45 — API Versioning
 
-Use:
-
-```text
-/v1/
-```
-
-from day one.
-
-Do not expose database entities directly through REST.
-
-Use:
+`/v1/` from day one, consistently, including the internal webhook path. Do not expose database entities directly through REST:
 
 ```text
-Controller
-  -> DTO
-  -> Application Service
-  -> Domain
-  -> Repository
+Controller -> DTO -> Application Service -> Domain -> Repository
 ```
 
 ---
 
-# 65. Step 46 — Transaction Service
-
-Create:
+## 65. Step 46 — Transaction Service
 
 ```java
 TransactionOrchestrator
 ```
 
-Responsibilities:
-
-- validate
-- create transaction
-- invoke compliance
-- invoke policy
-- reserve funds
-- call provider
-- process provider updates
-- finalize ledger
-
-It must NOT contain Fireblocks-specific implementation details.
+Responsibilities: validate, create transaction, invoke compliance, invoke policy, reserve funds, call provider, process provider updates, finalize ledger. Must NOT contain Fireblocks-specific implementation details.
 
 ---
 
-# 66. Step 47 — Ledger Service
-
-Create:
+## 66. Step 47 — Ledger Service
 
 ```java
 LedgerService
 ```
 
-Responsibilities:
-
-```text
-credit()
-reserve()
-release()
-settleWithdrawal()
-reverse()
-```
-
-Every operation must:
-
-1. validate
-2. lock position
-3. create immutable ledger entry
-4. update position
-5. create outbox event
-6. commit atomically
+Responsibilities: `credit()`, `reserve()`, `release()`, `settleWithdrawal()`, `reverse()`. Every operation must: validate → lock position → create immutable ledger entry → update position → create outbox event → commit atomically.
 
 ---
 
-# 67. Step 48 — Position Invariants
+## 67. Step 48 — Position Invariants
 
-The application must enforce:
-
-```text
-available >= 0
-locked >= 0
-pending >= 0
-```
-
-and:
-
-```text
-total = available + locked + pending
-```
-
-subject to the chosen transaction/settlement model.
-
-Never permit an API caller to directly set a position.
+`available >= 0`, `locked >= 0`, `pending >= 0` (enforced via DB `CHECK`, §14), and `total = available + locked + pending`. Never permit an API caller to directly set a position.
 
 ---
 
-# 68. Step 49 — MVP Reconciliation Invariant
+## 68. Step 49 — MVP Reconciliation Invariant
 
-At minimum:
-
-```text
-Client position total
-+
-bank-controlled operational position
-=
-Fireblocks-controlled balance
-```
-
-where the scope includes only the same:
-
-- asset
-- network
-- wallet population
-- settlement status
-
-Define exclusions explicitly.
-
-Do not compare incomparable balances.
+`Client position total + bank-controlled operational position = Fireblocks-controlled balance`, scoped to the same asset/network/wallet population/settlement status. Define exclusions explicitly. Do not compare incomparable balances.
 
 ---
 
-# 69. Step 50 — Build Order
+## 69. Step 50 — Build Order
 
-The AI agent must implement in this exact order.
+**Pre-flight:** §0.1 (key-custody model) should be an approved ADR before Sprint 3 — it can run in parallel with Sprint 1–2 since local build/test doesn't depend on it.
 
-### Sprint 1
-
+### Sprint 1 — Local foundation
 ```text
-1. Spring Boot project
-2. PostgreSQL
-3. Flyway
+1. Spring Boot project (Java 25, Spring Boot 4.1.x)
+2. docker-compose.yml: PostgreSQL 16 + app
+3. Liquibase changelog structure + first changesets
 4. Domain model
 5. Account API
 6. Asset/network API
 ```
 
 ### Sprint 2
-
 ```text
 7. Position
 8. Ledger
 9. Transaction
 10. Idempotency
 11. Audit
-12. Outbox
+12. Outbox (with local logging EventPublisher, §5.4 Option A)
 ```
 
 ### Sprint 3
-
 ```text
-13. Fireblocks adapter
-14. Fireblocks authentication
-15. Wallet mapping
-16. Deposit address
-17. Fireblocks webhook
+13. Key-custody model ADR sign-off (§0.1)
+14. Fireblocks adapter (against WireMock, then sandbox)
+15. Fireblocks authentication (sandbox keys via .env)
+16. Wallet mapping
+17. Deposit address
+18. Fireblocks webhook (local tunnel or fixture-driven)
 ```
 
 ### Sprint 4
-
 ```text
-18. Deposit lifecycle
-19. AML integration
-20. Deposit ledger posting
-21. Position update
+19. Deposit lifecycle
+20. AML integration (stub/WireMock)
+21. Deposit ledger posting
+22. Position update
 ```
 
 ### Sprint 5
-
 ```text
-22. Withdrawal API
-23. Policy
-24. Funds reservation
-25. Fireblocks submission
-26. Provider status handling
-27. Settlement
+23. Withdrawal API
+24. Policy
+25. Funds reservation
+26. Fireblocks submission (sandbox)
+27. Provider status handling
+28. Settlement
 ```
 
 ### Sprint 6
-
 ```text
-28. Reconciliation
-29. Exception handling
-30. Monitoring
-31. Security tests
-32. End-to-end tests
+29. Reconciliation
+30. Exception handling
+31. Monitoring (Actuator + logs)
+32. Security tests
+33. End-to-end tests (fully local via Testcontainers + WireMock)
 ```
 
-### Sprint 7
-
+### Sprint 7 — hardening, still local
 ```text
-33. API hardening
-34. Azure deployment
-35. operational runbook
-36. MVP acceptance test
+34. API hardening
+35. Local dev-JWT auth cleanup / entitlement checks finalized
+36. Operational runbook (local version)
+37. MVP acceptance test (§71)
 ```
+
+Azure migration (Appendix B) becomes Sprint 8+, once the MVP passes Sprint 7 locally.
 
 ---
 
-# 70. Definition of Done
+## 70. Definition of Done (local MVP)
 
-The MVP is DONE only when all of the following work.
-
-## Account
-
+### Account
 - [ ] Create custody account
 - [ ] Activate account
 - [ ] Freeze account
 - [ ] Retrieve account
 
-## Asset
-
+### Asset
 - [ ] Asset allow-list
 - [ ] Network allow-list
 - [ ] Asset/network allow-list
 
-## Wallet
-
-- [ ] Fireblocks wallet mapping
+### Wallet
+- [ ] Key-custody model ADR approved (§0.1)
+- [ ] Fireblocks (sandbox) wallet mapping
 - [ ] Deposit address
 - [ ] Unknown address handling
 
-## Deposit
-
-- [ ] Provider event received
+### Deposit
+- [ ] Provider event received (sandbox or fixture)
 - [ ] Event deduplicated
 - [ ] Account identified
-- [ ] AML/risk executed
+- [ ] AML/risk executed (stub or sandbox)
 - [ ] Confirmation tracked
 - [ ] Ledger credited
 - [ ] Position updated
 - [ ] Audit created
 
-## Withdrawal
-
+### Withdrawal
 - [ ] API request
 - [ ] Idempotency
 - [ ] Account validation
@@ -2306,77 +1621,71 @@ The MVP is DONE only when all of the following work.
 - [ ] AML/risk
 - [ ] Policy
 - [ ] Funds reservation
-- [ ] Fireblocks submission
+- [ ] Fireblocks submission (sandbox)
 - [ ] Provider ID stored
 - [ ] Confirmation
 - [ ] Ledger settlement
 - [ ] Failure reversal
 - [ ] Audit
 
-## Reconciliation
-
-- [ ] Provider balances imported
+### Reconciliation
+- [ ] Provider (sandbox) balances imported
 - [ ] Client positions calculated
 - [ ] Comparison
 - [ ] Break detection
-- [ ] Break alert
+- [ ] Break alert (log/console acceptable for MVP)
 - [ ] No automatic balance manipulation
 
-## Security
-
-- [ ] IAM
-- [ ] Authorization
-- [ ] Secret management
-- [ ] Provider authentication
+### Security
+- [ ] Local dev-JWT auth
+- [ ] Authorization (entitlement checks)
+- [ ] Secret management via `.env` (never committed)
+- [ ] Provider authentication (Fireblocks sandbox)
 - [ ] Webhook validation
 - [ ] Audit
 - [ ] No secrets in logs
 
-## Reliability
-
+### Reliability
 - [ ] Idempotency
-- [ ] Outbox
+- [ ] Outbox (local poller, §5.4 Option A minimum)
 - [ ] Retry
-- [ ] Dead-letter
+- [ ] Dead-letter / failed-event visibility
 - [ ] Transaction locking
 - [ ] Provider timeout handling
 
-## Testing
-
+### Testing
 - [ ] Unit tests
-- [ ] Integration tests
-- [ ] Provider mock tests
+- [ ] Integration tests (Testcontainers, Postgres 16)
+- [ ] Provider mock tests (WireMock)
 - [ ] Concurrent withdrawal test
 - [ ] Duplicate event test
-- [ ] E2E happy path
+- [ ] E2E happy path (fully local)
 - [ ] E2E failure paths
 
 ---
 
-# 71. Required E2E Acceptance Test
-
-The AI agent must create an automated test for:
+## 71. Required E2E Acceptance Test (runs entirely locally)
 
 ```text
 1. Create customer C001
 2. Create custody account CA001
 3. Activate CA001
 4. Configure BTC/Bitcoin
-5. Create/retrieve Fireblocks wallet mapping
+5. Create/retrieve Fireblocks wallet mapping (sandbox or WireMock)
 6. Generate BTC deposit address
-7. Simulate Fireblocks deposit event
+7. Simulate Fireblocks deposit event (fixture payload or WireMock stub)
 8. Verify provider event stored
 9. Verify deposit transaction created
-10. Run AML/risk
+10. Run AML/risk (stub)
 11. Mark deposit confirmed
 12. Post 1 BTC to ledger
 13. Verify CA001 position = 1 BTC
 14. Request 0.4 BTC withdrawal
-15. Run AML
+15. Run AML (stub)
 16. Run policy
 17. Reserve 0.4 BTC
 18. Verify available = 0.6 BTC
-19. Submit Fireblocks transaction
+19. Submit Fireblocks transaction (sandbox or WireMock)
 20. Store provider transaction ID
 21. Simulate confirmation
 22. Settle withdrawal
@@ -2385,278 +1694,249 @@ The AI agent must create an automated test for:
 25. Verify MATCH
 ```
 
-Also test:
+Also test — two simultaneous withdrawals of 0.7 BTC against a 1 BTC balance. Expected: one succeeds, one fails, total reservation never exceeds 1 BTC. This test is exactly why Testcontainers (real Postgres locking semantics) matters more than an in-memory DB for this suite.
 
-```text
-Two simultaneous withdrawals of 0.7 BTC
-against a 1 BTC balance.
+---
+
+## 72. AI Agent Rules
+
+**Rule 1** — Do not invent Fireblocks API endpoints or request/response fields. Use the Fireblocks developer documentation.
+**Rule 2** — Do not put Fireblocks-specific types in the core domain.
+**Rule 3** — Do not use floating-point types for asset amounts.
+**Rule 4** — Do not mutate ledger entries.
+**Rule 5** — Do not directly modify positions from controllers.
+**Rule 6** — Do not allow products to call Fireblocks.
+**Rule 7** — Do not bypass policy/AML for withdrawals.
+**Rule 8** — Do not automatically fix reconciliation breaks.
+**Rule 9** — Do not silently process unknown blockchain addresses.
+**Rule 10** — Do not log secrets/private keys/tokens.
+**Rule 11** — Do not create a microservice for every domain object.
+**Rule 12** — Do not add out-of-scope functionality to the MVP.
+**Rule 13** — Do not implement Fireblocks signing/vault topology before the key-custody model (§0.1) is confirmed.
+**Rule 14** — Do not add Azure-specific code/config to the local MVP path. Keep all Azure concerns in Appendix B until explicitly asked to build them.
+**Rule 15** — Do not write raw SQL migrations outside Liquibase changesets, and do not hand-edit the schema of a running local database.
+
+---
+
+## 73. Production Gate — Regulatory/Operational Review
+
+Before production, the MVP must be reviewed by the bank's Compliance, Legal, Information Security, Operational Risk, DORA/ICT Risk, Internal Audit, Data Protection, Architecture, Business Continuity, and Custody Operations functions. This README is not a legal opinion or regulatory approval.
+
+MiCA custody requirements and applicable RTS/technical standards must be mapped by the bank's regulatory/legal teams to concrete controls before production. `compliance_reference` (§11), `audit_event` (§23), and `policy_decision`/`compliance_screening` (§18–19) are the primary evidence trail.
+
+For ICT outsourcing, perform the required third-party risk assessment of Fireblocks (resilience, incident handling, audit/access, data handling, exit/termination, concentration risk) before production — the key-custody model (§0.1) is a primary input, since it determines actual dependency on Fireblocks for signing availability.
+
+---
+
+## 74. What NOT to build after this MVP
+
+tokenisation, trading, staking, exchange, lending, DeFi, NFT custody, multi-custodian routing, advanced fee engine, Travel Rule platform, blockchain indexer, custom MPC, custom HSM, customer UI, or any Azure automation beyond what Appendix B calls for. Those are separate initiatives.
+
+> **The MVP goal:** a bank-owned custody control plane, buildable and testable entirely on a local machine with Docker, that can securely create custody accounts, maintain client positions, accept deposits, execute withdrawals through Fireblocks, enforce AML/policy controls, maintain an auditable transaction lifecycle, and reconcile bank positions against custody infrastructure.
+
+---
+
+## 75. Local Docker Compose Stack
+
+`docker-compose.yml` (baseline — Postgres + app, always used):
+
+```yaml
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: custody-postgres
+    environment:
+      POSTGRES_DB: custody
+      POSTGRES_USER: custody_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdevpassword}
+    ports:
+      - "5432:5432"
+    volumes:
+      - custody_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U custody_app -d custody"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: custody-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/custody
+      SPRING_DATASOURCE_USERNAME: custody_app
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-localdevpassword}
+      FIREBLOCKS_BASE_PATH: ${FIREBLOCKS_BASE_PATH:-http://wiremock:8080}
+      FIREBLOCKS_API_KEY: ${FIREBLOCKS_API_KEY:-dummy}
+      MESSAGING_MODE: ${MESSAGING_MODE:-local}
+    ports:
+      - "8080:8080"
+
+  wiremock:
+    image: wiremock/wiremock:latest
+    container_name: custody-wiremock
+    ports:
+      - "9561:8080"
+    volumes:
+      - ./wiremock/mappings:/home/wiremock/mappings
+      - ./wiremock/__files:/home/wiremock/__files
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: custody-pgadmin
+    profiles: ["tools"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: [email protected]
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+volumes:
+  custody_pg_data:
 ```
 
-Expected:
+Optional messaging overlay `docker-compose.messaging.yml` (§5.4 Option B — only start this if you want emulator-backed Service Bus locally):
 
-```text
-One succeeds.
-One fails.
-Never allow total reservation > 1 BTC.
+```yaml
+version: "3.9"
+
+services:
+  sql-edge:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: custody-sql-edge
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${SQL_EDGE_PASSWORD:-LocalDevP@ss1}
+    ports:
+      - "1433:1433"
+
+  servicebus-emulator:
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:latest
+    container_name: custody-servicebus-emulator
+    depends_on:
+      - sql-edge
+    environment:
+      SQL_SERVER: sql-edge
+      MSSQL_SA_PASSWORD: ${SQL_EDGE_PASSWORD:-LocalDevP@ss1}
+      ACCEPT_EULA: "Y"
+    ports:
+      - "5672:5672"   # AMQP
+      - "5300:5300"   # management
+    volumes:
+      - ./config/servicebus-emulator/Config.json:/ServiceBus_Emulator/ConfigFiles/Config.json
 ```
 
----
-
-# 72. AI Agent Rules
-
-The AI coding agent must follow these rules.
-
-## Rule 1
-
-Do not invent Fireblocks API endpoints or request/response fields.
-
-Use the Fireblocks developer documentation available to the project.
-
-## Rule 2
-
-Do not put Fireblocks-specific types in the core domain.
-
-## Rule 3
-
-Do not use floating-point types for asset amounts.
-
-## Rule 4
-
-Do not mutate ledger entries.
-
-## Rule 5
-
-Do not directly modify positions from controllers.
-
-## Rule 6
-
-Do not allow products to call Fireblocks.
-
-## Rule 7
-
-Do not bypass policy/AML for withdrawals.
-
-## Rule 8
-
-Do not automatically fix reconciliation breaks.
-
-## Rule 9
-
-Do not silently process unknown blockchain addresses.
-
-## Rule 10
-
-Do not log secrets/private keys/tokens.
-
-## Rule 11
-
-Do not create a microservice for every domain object.
-
-## Rule 12
-
-Do not add out-of-scope functionality to the MVP.
-
----
-
-# 73. Production Gate — Regulatory/Operational Review
-
-Before production, the engineering MVP must be reviewed by the bank's:
-
-- Compliance
-- Legal
-- Information Security
-- Operational Risk
-- DORA/ICT Risk
-- Internal Audit
-- Data Protection
-- Architecture
-- Business Continuity
-- Custody Operations
-
-The engineering team must not interpret this README as a legal opinion or regulatory approval.
-
-MiCA custody requirements and applicable RTS/technical standards must be mapped by the bank's regulatory/legal teams to concrete controls before production. The technical implementation should retain evidence needed to demonstrate those controls.
-
-For ICT outsourcing, perform the bank's required third-party risk assessment and contractual review of Fireblocks, including resilience, incident handling, audit/access, data handling, exit/termination and concentration/third-party risk.
-
----
-
-# 74. Final MVP Architecture
-
-The final MVP should look like:
-
-```text
-                         BANK PRODUCTS
-                              |
-                              v
-                    +-------------------+
-                    | API Management    |
-                    +---------+---------+
-                              |
-                              v
-                    +-------------------+
-                    | Spring Boot       |
-                    | Custody Platform  |
-                    +---------+---------+
-                              |
-        +---------------------+---------------------+
-        |                     |                     |
-        v                     v                     v
-   ACCOUNT/ASSET          COMPLIANCE           TRANSACTION
-   ENTITLEMENT             + POLICY             ORCHESTRATOR
-        |                     |                     |
-        +---------------------+---------------------+
-                              |
-                              v
-                    +-------------------+
-                    | POSITION + LEDGER |
-                    | PostgreSQL        |
-                    +---------+---------+
-                              |
-                    +---------+---------+
-                    |                   |
-                    v                   v
-              Outbox/Event        Reconciliation
-                    |
-                    v
-              Azure Service Bus
-                    |
-                    |
-                    v
-             Fireblocks Adapter
-                    |
-                    v
-                Fireblocks
-                    |
-          +---------+---------+
-          |         |         |
-       Wallets    MPC      Blockchain
-```
-
----
-
-# 75. What NOT to build after this MVP
-
-Do not let the coding agent expand scope into:
-
-- tokenisation
-- trading
-- staking
-- exchange
-- lending
-- DeFi
-- NFT custody
-- multi-custodian routing
-- advanced fee engine
-- Travel Rule platform
-- blockchain indexer
-- custom MPC
-- custom HSM
-- customer UI
-
-Those are separate initiatives.
-
-The MVP goal is simply:
-
-> **A bank-owned custody control plane that can securely create custody accounts, maintain client positions, accept deposits, execute withdrawals through Fireblocks, enforce AML/policy controls, maintain an auditable transaction lifecycle, and reconcile bank positions against custody infrastructure.**
-
----
-
-## Appendix — Runbook, Integration Steps, and Checklist
-
-Below are actionable steps to run the project locally, integrate with Fireblocks (sandbox), and a compact production checklist.
-
-**Environment & secrets**: use environment variables or a secrets store (Azure Key Vault). Required variables (local `.env` or environment):
-
-- **Postgres**: `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`
-- **Fireblocks**: `FIREBLOCKS_BASE_PATH`, `FIREBLOCKS_API_KEY`, `FIREBLOCKS_SECRET_KEY` (private key or path)
-- **Spring profile**: `SPRING_PROFILES_ACTIVE=local`
-
-Do NOT commit real keys. Use `.env.example` as a template for local development.
-
-**Build & run (local)**
-
-1. Build the project (skip tests during iterative development):
+Run baseline stack:
 
 ```bash
-mvn -U -DskipTests clean package
+docker compose up --build
 ```
 
-2. Run the app:
+Run with the optional messaging emulator:
 
 ```bash
+docker compose -f docker-compose.yml -f docker-compose.messaging.yml up --build
+```
+
+Then set `MESSAGING_MODE=servicebus-emulator` and `SERVICEBUS_CONNECTION_STRING=Endpoint=sb://localhost:5672;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;` in `.env`.
+
+Run just Postgres for `mvn spring-boot:run` outside Docker:
+
+```bash
+docker compose up postgres -d
 mvn spring-boot:run
-# or
-java -jar target/digital-asset-custody-0.1.0-SNAPSHOT.jar
 ```
 
-**Docker / Compose (local)**
+---
 
-- Use `docker-compose.yml` (repo) to start Postgres and the app. Example:
+## 76. Local Build & Run Cheatsheet
 
 ```bash
-docker-compose up --build
+# 1. Copy env template and fill in Fireblocks sandbox creds
+cp .env.example .env
+
+# 2. Build (skip tests during iterative dev)
+mvn -U -DskipTests clean package
+
+# 3. Bring up local infra + app
+docker compose up --build
+
+# 4. Apply/verify Liquibase changelog manually (optional — Spring Boot runs it on startup)
+mvn liquibase:update
+
+# 5. Roll back the last changeset if you need to iterate on schema
+mvn liquibase:rollback -Dliquibase.rollbackCount=1
 ```
 
-Ensure the app reads DB URL and credentials from environment variables passed to the container.
-
-**Fireblocks sandbox setup (high level)**
-
-1. Request a Fireblocks sandbox account / tenant (developer onboarding).
-2. Create an API key in Fireblocks and download the signing key (private key). Store this key securely (Key Vault). Do NOT commit it.
-3. Configure the app to use Fireblocks sandbox base path (default `https://sandbox-api.fireblocks.io/v1`) and supply the API key and key material via environment variables or Key Vault.
-4. Register a webhook endpoint in Fireblocks pointing to `/api/v1/webhooks/fireblocks` (or internal provider endpoint if behind gateway). Configure Fireblocks to sign webhooks — implement signature verification before processing.
-
-**Webhook handling (MVP guidance)**
-
-- Webhook endpoint must: validate signature, persist `provider_event` (unique provider_event_id), publish an internal message (outbox / Service Bus) and return quickly (202/200). Do not perform lengthy business processing in the HTTP handler.
-- Maintain idempotency by enforcing UNIQUE(provider, provider_event_id) in `provider_event` table.
-
-**API examples (minimal)**
-
-- Create account:
+**API examples:**
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/accounts -H "Content-Type: application/json" \
-    -d '{"externalCustomerId":"C001","name":"Customer 1"}'
-```
+# Create account
+curl -X POST http://localhost:8080/v1/custody-accounts \
+    -H "Content-Type: application/json" \
+    -d '{"customerId":"C001"}'
 
-- Create deposit address (idempotent):
-
-```bash
-curl -X POST http://localhost:8080/api/v1/custody-accounts/1/deposit-addresses \
+# Create deposit address (idempotent)
+curl -X POST http://localhost:8080/v1/custody-accounts/{accountId}/deposit-addresses \
     -H "Content-Type: application/json" \
     -d '{"asset":"BTC","network":"BITCOIN"}'
-```
 
-- Request withdrawal (Idempotency-Key required header):
-
-```bash
-curl -X POST http://localhost:8080/api/v1/custody-accounts/1/withdrawals \
+# Request withdrawal (Idempotency-Key required)
+curl -X POST http://localhost:8080/v1/custody-accounts/{accountId}/withdrawals \
     -H "Content-Type: application/json" \
     -H "Idempotency-Key: $(uuidgen)" \
     -d '{"asset":"BTC","network":"BITCOIN","amount":"0.4","destinationAddress":"bc1..."}'
 ```
 
-**Production checklist (short)**
+**Local production-readiness checklist (before touching Azure):**
 
-- Secrets: move Fireblocks keys, DB credentials to Azure Key Vault and access via Managed Identity.
-- Networking: expose only API gateway; use mTLS / OAuth2 for product APIs.
-- Monitoring: enable Spring Boot Actuator endpoints, Application Insights, and log shipping to Log Analytics.
-- Resilience: implement outbox + Service Bus for provider events, retries, and DLQ.
-- Security: webhook signature verification, idempotency enforcement, no secrets in logs.
-- Operational: reconciliation job, alerting (reconciliation breaks), and runbook for freeze/unfreeze.
+- [ ] Key-custody model ADR approved (§0.1)
+- [ ] Full E2E test (§71) green via Testcontainers
+- [ ] Concurrency test (two simultaneous withdrawals) green
+- [ ] Security test suite (§53) green
+- [ ] Liquibase changelog fully reproducible from empty DB (`docker compose down -v && docker compose up --build`)
+- [ ] No secrets committed anywhere in the repo (`git log -p | grep -i` sanity pass, or a secret-scanning pre-commit hook)
+- [ ] Reconciliation break path manually exercised at least once
 
-**Testing & CI guidance**
+---
 
-- Unit tests: JUnit 5 + Mockito for services and policy rules.
-- Integration tests: Testcontainers for Postgres and WireMock for Fireblocks.
-- CI pipeline: run `mvn -DskipTests=false verify` in PRs; run integration tests on a dedicated runner.
+## Appendix A — Glossary
 
-**Next steps for me (if you want):**
+| Term | Meaning |
+|---|---|
+| **MPC/TSS** | Multi-Party Computation / Threshold Signature Scheme — key material is split into shares across parties; no single party ever holds the full private key. |
+| **HSM** | Hardware Security Module — dedicated hardware for key storage/signing. |
+| **Vault/Workspace** | Fireblocks' unit of wallet/key organisation for a client or asset. |
+| **Co-signer** | A party (or system) that must approve/sign a transaction as part of a multi-party or MPC scheme. |
+| **CASP** | Crypto-Asset Service Provider, the MiCA authorisation category this custody platform falls under. |
+| **Omnibus balance** | A pooled on-chain balance representing multiple clients' positions, reconciled against the sum of individual client ledger positions. |
+| **Idempotency key** | A caller-supplied unique token ensuring a repeated request does not create duplicate side effects. |
+| **Outbox pattern** | Writing an event to a DB table in the same transaction as the state change, then publishing it asynchronously — avoids dual-write inconsistency between DB and message bus. |
+| **Liquibase changeset** | A single, uniquely-identified, versioned unit of schema change, tracked in `DATABASECHANGELOG` so it's applied exactly once. |
 
-- Wire real Fireblocks SDK integration (requires sandbox keys) and implement request signing / webhook verification.
-- Implement `provider_event` persistence and outbox publishing to Azure Service Bus.
-- Add simple policy engine stub and AML provider interface.
+---
 
-If you'd like, I will now wire the Fireblocks SDK calls (you said you have access) and implement webhook verification and provider_event persistence — confirm and provide sandbox keys or allow me to use a WireMock-based stub.
+## Appendix B — Later: Moving to Azure
+
+This section is intentionally short — it's a pointer, not a build guide, since Azure work is deferred until the local MVP (§70) is done.
+
+| Local (MVP) | Azure equivalent (later) | Notes |
+|---|---|---|
+| Docker Compose `postgres:16` | Azure Database for PostgreSQL Flexible Server (v16) | Liquibase changelogs are identical — same schema, same tool, different `SPRING_DATASOURCE_URL`. |
+| `.env` file | Azure Key Vault + Managed Identity | Swap the config source, not the config keys. |
+| Local `EventPublisher` (Option A) or Service Bus emulator (Option B) | Real Azure Service Bus | If you built against the emulator's SDK/connection-string pattern, this is a connection-string change only. |
+| WireMock stub for Fireblocks/AML | Same sandbox/production endpoints, same adapter code | Only `FIREBLOCKS_BASE_PATH` / credentials change — the `CustodyExecutionProvider`/`ComplianceProvider` interfaces don't. |
+| Local dev-JWT | Bank IAM via OAuth2/OIDC, mTLS | Only the authentication filter changes; entitlement/authorization logic (§45) stays the same. |
+| Console/file logs | Application Insights, Log Analytics | Actuator + structured logging already produces what's needed; just add the shipping. |
+| No API gateway | Azure API Management | Public API contract (§54) doesn't change — only where it's fronted. |
+| No IaC | Terraform under `infrastructure/terraform` | Placeholder directory already reserved in §6. |
+
+**When you're ready to move:** the production gate in §73 (Compliance/Legal/InfoSec/Risk/Audit/DPO/Architecture/BCM/Custody Ops review) still applies before anything in this table touches production data — moving from local Docker to Azure does not substitute for that review, and the ICT-outsourcing risk assessment for Fireblocks should already be underway in parallel with local development, not started only once Azure work begins.

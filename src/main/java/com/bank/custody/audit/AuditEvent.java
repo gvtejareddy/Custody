@@ -1,6 +1,7 @@
 package com.bank.custody.audit;
 
 import jakarta.persistence.*;
+
 import java.time.OffsetDateTime;
 
 @Entity
@@ -27,4 +28,5 @@ public class AuditEvent {
     public void setDetails(String details) { this.details = details; }
     public OffsetDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(OffsetDateTime createdAt) { this.createdAt = createdAt; }
+
 }

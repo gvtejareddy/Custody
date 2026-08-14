@@ -1,0 +1,29 @@
+services:
+  app:
+    environment:
+      MESSAGING_MODE: servicebus-emulator
+      SERVICEBUS_CONNECTION_STRING: Endpoint=sb://servicebus-emulator;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;
+
+  sql-edge:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: custody-sql-edge
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${SQL_EDGE_PASSWORD:-LocalDevP@ss1}
+    ports:
+      - "1433:1433"
+
+  servicebus-emulator:
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:latest
+    container_name: custody-servicebus-emulator
+    depends_on:
+      - sql-edge
+    environment:
+      SQL_SERVER: sql-edge
+      MSSQL_SA_PASSWORD: ${SQL_EDGE_PASSWORD:-LocalDevP@ss1}
+      ACCEPT_EULA: "Y"
+    ports:
+      - "5672:5672"
+      - "5300:5300"
+    volumes:
+      - ./config/servicebus-emulator/Config.json:/ServiceBus_Emulator/ConfigFiles/Config.json

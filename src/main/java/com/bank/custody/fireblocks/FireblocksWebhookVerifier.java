@@ -2,6 +2,7 @@ package com.bank.custody.fireblocks;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -16,6 +17,7 @@ import java.util.Base64;
 import java.util.Map;
 
 @Component
+@ConditionalOnProperty(prefix = "fireblocks.webhook", name = "signing-secret")
 public class FireblocksWebhookVerifier implements WebhookVerifier {
 
     private final FireblocksProperties props;

@@ -12,12 +12,12 @@ import java.util.List;
 public class OutboxPublisher {
 
     private final OutboxRepository outboxRepository;
-    private final ServiceBusPublisher serviceBusPublisher;
+    private final EventPublisher eventPublisher;
     private final DeadLetterHandler deadLetterHandler;
 
-    public OutboxPublisher(OutboxRepository outboxRepository, ServiceBusPublisher serviceBusPublisher, DeadLetterHandler deadLetterHandler) {
+    public OutboxPublisher(OutboxRepository outboxRepository, EventPublisher eventPublisher, DeadLetterHandler deadLetterHandler) {
         this.outboxRepository = outboxRepository;
-        this.serviceBusPublisher = serviceBusPublisher;
+        this.eventPublisher = eventPublisher;
         this.deadLetterHandler = deadLetterHandler;
     }
 
@@ -27,12 +27,7 @@ public class OutboxPublisher {
         List<OutboxEvent> pending = outboxRepository.findPending(OffsetDateTime.now());
         for (OutboxEvent e : pending) {
             try {
-                if (serviceBusPublisher != null) {
-                    serviceBusPublisher.send(e);
-                } else {
-                    // For MVP: log the event if no Service Bus configured.
-                    System.out.println("Outbox publish: id=" + e.getId() + " type=" + e.getType());
-                }
+                eventPublisher.publish(e);
                 e.setProcessed(true);
                 outboxRepository.save(e);
                 } catch (Exception ex) {

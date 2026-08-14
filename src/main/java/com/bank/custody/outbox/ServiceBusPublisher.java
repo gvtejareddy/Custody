@@ -5,18 +5,20 @@ import com.azure.messaging.servicebus.ServiceBusSenderClient;
 import com.azure.messaging.servicebus.ServiceBusMessage;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
 @Component
-public class ServiceBusPublisher {
+@ConditionalOnProperty(prefix = "messaging", name = "mode", havingValue = "servicebus-emulator")
+public class ServiceBusPublisher implements EventPublisher {
 
     private final String connectionString;
     private final String queueName;
     private ServiceBusSenderClient sender;
 
-    public ServiceBusPublisher(@Value("${AZURE_SERVICE_BUS_CONNECTION_STRING:}") String connectionString,
+    public ServiceBusPublisher(@Value("${messaging.servicebus.connection-string:}") String connectionString,
                                @Value("${outbox.queue-name:outbox-events}") String queueName) {
         this.connectionString = connectionString;
         this.queueName = queueName;
@@ -32,7 +34,8 @@ public class ServiceBusPublisher {
                 .buildClient();
     }
 
-    public void send(OutboxEvent e) {
+    @Override
+    public void publish(OutboxEvent e) {
         if (sender == null) throw new IllegalStateException("ServiceBus sender not initialized");
         ServiceBusMessage msg = new ServiceBusMessage(e.getPayload());
         msg.setContentType("application/json");

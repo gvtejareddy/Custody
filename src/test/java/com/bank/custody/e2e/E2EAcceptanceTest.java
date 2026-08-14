@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Assertions;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.*;
@@ -29,13 +30,14 @@ import com.bank.custody.ledger.LedgerService;
 import com.bank.custody.reconcile.ReconciliationRepository;
 import com.bank.custody.outbox.LocalOutboxProcessor;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, classes = {com.bank.custody.Application.class, com.bank.custody.TestSecurityConfiguration.class})
 @Testcontainers
+@ActiveProfiles("test")
 public class E2EAcceptanceTest {
 
     @Container
     @SuppressWarnings("resource")
-    public static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15-alpine")
+    public static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine")
             .withDatabaseName("custody_test")
             .withUsername("sa")
             .withPassword("sa");
@@ -76,6 +78,13 @@ public class E2EAcceptanceTest {
 
     RestTemplate rest = new RestTemplate();
 
+    private HttpHeaders authHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth("local-dev-token");
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        return headers;
+    }
+
     @Autowired
     ProviderEventRepository providerEventRepository;
 
@@ -103,7 +112,7 @@ public class E2EAcceptanceTest {
         String base = "http://localhost:"+port;
         ResponseEntity<Map<String,Object>> accResp = rest.exchange(base + "/api/v1/accounts",
             HttpMethod.POST,
-            new HttpEntity<>(Map.of("externalCustomerId","C001","name","Customer 1"), new HttpHeaders()),
+            new HttpEntity<>(Map.of("externalCustomerId","C001","name","Customer 1"), authHeaders()),
             new ParameterizedTypeReference<Map<String,Object>>(){});
         Assertions.assertEquals(HttpStatus.CREATED, accResp.getStatusCode());
         Number accountIdNum = (Number) accResp.getBody().get("id");
@@ -112,22 +121,22 @@ public class E2EAcceptanceTest {
         // 4 Configure BTC
         ResponseEntity<Map<String,Object>> assetResp = rest.exchange(base + "/api/v1/assets",
             HttpMethod.POST,
-            new HttpEntity<>(Map.of("symbol","BTC","name","Bitcoin","active",true), new HttpHeaders()),
+            new HttpEntity<>(Map.of("symbol","BTC","name","Bitcoin","network","BITCOIN","active",true), authHeaders()),
             new ParameterizedTypeReference<Map<String,Object>>(){});
         Assertions.assertEquals(HttpStatus.CREATED, assetResp.getStatusCode());
 
         // 5-6 Create/retrieve Fireblocks wallet mapping + deposit address
         ResponseEntity<Map<String,Object>> addrResp = rest.exchange(base + "/api/v1/custody-accounts/"+accountId+"/deposit-addresses",
             HttpMethod.POST,
-            new HttpEntity<>(Map.of("asset","BTC","network","BITCOIN"), new HttpHeaders()),
+            new HttpEntity<>(Map.of("asset","BTC","network","BITCOIN"), authHeaders()),
             new ParameterizedTypeReference<Map<String,Object>>(){});
         Assertions.assertTrue(addrResp.getStatusCode().is2xxSuccessful());
         String address = (String) addrResp.getBody().get("address");
 
         // 7 Simulate Fireblocks deposit event
         Map<String,Object> depositEvt = Map.of("id","evt-dep-1","type","deposit","address", address, "amount","1","status","confirmed");
-        HttpHeaders headers = new HttpHeaders(); headers.setContentType(MediaType.APPLICATION_JSON);
-        ResponseEntity<String> wh = rest.postForEntity(base + "/api/v1/webhooks/fireblocks", depositEvt, String.class);
+        HttpHeaders headers = authHeaders();
+        ResponseEntity<String> wh = rest.postForEntity(base + "/api/v1/webhooks/fireblocks", new HttpEntity<>(depositEvt, headers), String.class);
         Assertions.assertEquals(HttpStatus.OK, wh.getStatusCode());
 
         // process outbox manually
@@ -147,7 +156,7 @@ public class E2EAcceptanceTest {
         Assertions.assertEquals(0, posOpt.get().getAvailable().compareTo(new java.math.BigDecimal("1")));
 
         // 14-20 Request withdrawal 0.4 BTC
-        HttpHeaders reqHeaders = new HttpHeaders(); reqHeaders.set("Idempotency-Key", "idemp-1"); reqHeaders.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders reqHeaders = authHeaders(); reqHeaders.set("Idempotency-Key", "idemp-1");
         HttpEntity<Map<String,Object>> withdrawReq = new HttpEntity<>(Map.of("asset","BTC","network","BITCOIN","amount","0.4","destinationAddress","bc1..."), reqHeaders);
         ResponseEntity<Map<String,Object>> wresp = rest.exchange(base + "/api/v1/custody-accounts/"+accountId+"/withdrawals",
             HttpMethod.POST,
@@ -177,7 +186,7 @@ public class E2EAcceptanceTest {
         // create two threads
         ExecutorService svc = Executors.newFixedThreadPool(2);
         Callable<Boolean> c1 = () -> {
-            HttpHeaders h = new HttpHeaders(); h.set("Idempotency-Key", "c1"); h.setContentType(MediaType.APPLICATION_JSON);
+            HttpHeaders h = authHeaders(); h.set("Idempotency-Key", "c1");
             HttpEntity<Map<String,Object>> r = new HttpEntity<>(Map.of("asset","BTC","network","BITCOIN","amount","0.7","destinationAddress","bc1a"), h);
                 ResponseEntity<Map<String,Object>> resp = rest.exchange(base + "/api/v1/custody-accounts/"+accountId+"/withdrawals",
                     HttpMethod.POST,
@@ -186,7 +195,7 @@ public class E2EAcceptanceTest {
             return resp.getStatusCode()==HttpStatus.CREATED;
         };
         Callable<Boolean> c2 = () -> {
-            HttpHeaders h = new HttpHeaders(); h.set("Idempotency-Key", "c2"); h.setContentType(MediaType.APPLICATION_JSON);
+            HttpHeaders h = authHeaders(); h.set("Idempotency-Key", "c2");
             HttpEntity<Map<String,Object>> r = new HttpEntity<>(Map.of("asset","BTC","network","BITCOIN","amount","0.7","destinationAddress","bc1b"), h);
                 ResponseEntity<Map<String,Object>> resp = rest.exchange(base + "/api/v1/custody-accounts/"+accountId+"/withdrawals",
                     HttpMethod.POST,
