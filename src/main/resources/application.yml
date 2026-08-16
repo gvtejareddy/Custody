@@ -3,9 +3,9 @@ server:
 
 spring:
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/custody}
-    username: ${SPRING_DATASOURCE_USERNAME:custody_app}
-    password: ${SPRING_DATASOURCE_PASSWORD:localdevpassword}
+    url: jdbc:postgresql://localhost:5432/custody
+    username: custody_app
+    password: changeme
   jpa:
     hibernate:
       ddl-auto: validate

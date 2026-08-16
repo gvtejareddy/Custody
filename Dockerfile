@@ -2,7 +2,7 @@ FROM maven:3.9.11-eclipse-temurin-25 AS build
 WORKDIR /workspace
 COPY pom.xml ./
 COPY src ./src
-RUN mvn -B -DskipTests package
+RUN mvn clean install -B -DskipTests
 
 FROM eclipse-temurin:25-jre
 WORKDIR /app
